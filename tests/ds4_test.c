@@ -5807,7 +5807,7 @@ static void test_official_logprob_vectors_run(const char *case_filter) {
     } else {
         unsetenv("DS4_METAL_DISABLE_METAL4");
     }
-    ds4_engine *engine = test_open_engine(false);
+    ds4_engine *engine = test_get_engine(true);
     if (!engine) {
         test_restore_canonical_streaming_prefill(saved_canonical_streaming_prefill);
         test_restore_env("DS4_METAL_DISABLE_METAL4", saved_disable_metal4);
