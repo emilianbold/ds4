@@ -251,19 +251,4 @@ DGX Spark results, comparison conditions, and benchmark commands.
 ## Detailed Guides
 
 - [Models and vision](docs/MODELS.md): Flash, PRO, GLM, Qwen, and matching encoders.
-- [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup, MTP, vision, and validation.
-- [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
-- [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM and Qwen MTP, and sampling.
-- [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
-- [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
-- [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
-- [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
-
-## Logo
-
-The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
-graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
-it rock.
+- [Qwen3.8 Flash Next](docs/QWEN38_FLASH_NEXT.md): model setup
