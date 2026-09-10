@@ -66699,10 +66699,12 @@ bool ds4_session_vision_state_matches(
 
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count) {
-    if (!s || !s->checkpoint_valid || (image_count && !images) ||
+    if (!s || (image_count && !images) ||
         image_count != s->checkpoint_image_count) return false;
     for (size_t i = 0; i < image_count; i++) {
-        if (images[i].embedding.token_count != s->checkpoint_images[i].token_count ||
+        if ((uint64_t)s->checkpoint_images[i].token_start +
+                s->checkpoint_images[i].token_count > (uint64_t)s->checkpoint.len ||
+            images[i].embedding.token_count != s->checkpoint_images[i].token_count ||
             memcmp(images[i].embedding.fingerprint, s->checkpoint_images[i].fingerprint,
                    sizeof(images[i].embedding.fingerprint))) return false;
     }

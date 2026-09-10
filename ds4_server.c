@@ -10603,6 +10603,7 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
     if (!live || !suffix || req->image_count > 16) return false;
+    const bool reusable = ds4_session_common_prefix(slot->session, live) == live->len;
     ds4_vision_span spans[16];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
@@ -10634,7 +10635,10 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
         cursor = marker + strlen(req->image_markers[i]);
     }
     ds4_tokenize_rendered_chat(s->engine, cursor, &prompt);
-    if (!ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
+    /* Rebased historical images are authenticated even if a terminal rewind
+     * invalidated KV. New images were appended beyond the retained frontier. */
+    if (reusable &&
+        !ds4_session_vision_prefix_matches(slot->session, spans, req->image_count)) {
         ds4_tokens_free(&prompt);
         return false;
     }
@@ -12429,11 +12433,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                    live_vision_match ? "match" : "mismatch",
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (multimodal && cached > 0) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
-                   j->req.image_count, cached, prompt_for_sync->len);
-    }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
         old_pos >= s->kv.opt.min_tokens) {
@@ -12462,6 +12461,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         responses_protocol &&
         j->req.responses_requires_live_reasoning &&
         !responses_reasoning_state_preserved;
+    /* A live binding may preserve history without reusable KV after a terminal
+     * rewind. Keep its effective prompt, but let sync rebuild and report a miss. */
+    if (cached > 0) cached = ds4_session_common_prefix(slot->session, prompt_for_sync);
+    if (cached == 0) slot->continued_last_store_tokens = 0;
+    if (multimodal && cached > 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: multimodal live kv hit images=%zu cached=%d prompt=%d identity=fingerprint-match",
+                   j->req.image_count, cached, prompt_for_sync->len);
+    }
     const int prompt_tokens = prompt_for_sync->len;
     /* OpenAI usage details: the reusable prefix is a cache read, while the
      * effective prompt suffix evaluated by ds4_session_sync() is written into
@@ -12569,6 +12577,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
         if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+            request_live_state_clear(s, slot);
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
@@ -12604,6 +12613,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                        err, sizeof(err)) :
         server_session_sync(s, slot, prompt_for_sync, err, sizeof(err));
     if (prompt_sync_rc != 0) {
+        request_live_state_clear(s, slot);
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -13077,7 +13087,7 @@ decode_again:
             }
         }
         if (completion >= max_tokens ||
-            ds4_session_pos(slot->session) >= ds4_session_ctx(slot->session)) {
+            block_start + kept >= ds4_session_ctx(slot->session)) {
             stop_decode = true;
         }
         if (!stop_decode && kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {

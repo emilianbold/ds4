@@ -67,7 +67,22 @@ static void test_vision_prefix(void) {
     assert(!ds4_session_vision_prefix_matches(s, swapped, 2));
     s->checkpoint_valid = false;
     assert(!ds4_session_vision_prefix_matches(s, images, 2));
+    /* Retained image identity is useful for rebuilding, not a KV cache hit. */
+    images[0].token_start = 7;
+    images[1].token_start = 8;
+    assert(ds4_session_rebase_vision_state(s, images, 2));
+    assert(images[0].token_start == 50 && images[1].token_start == 70);
+    assert(!ds4_session_vision_prefix_matches(s, images, 2));
+    assert(!s->checkpoint_valid);
+    images[0].token_start = 7;
+    images[1].token_start = 8;
+    images[1].embedding.fingerprint[0] ^= 1;
     assert(!ds4_session_rebase_vision_state(s, images, 2));
+    assert(images[0].token_start == 7 && images[1].token_start == 8);
+    images[1].embedding.fingerprint[0] ^= 1;
+    s->checkpoint.len = 79;
+    assert(!ds4_session_rebase_vision_state(s, images, 2));
+    assert(images[0].token_start == 7 && images[1].token_start == 8);
     free(s);
 }
 
@@ -111,6 +126,21 @@ static void test_rewind(void) {
     }
     ds4_session_rewind(s, -1);
     ds4_session_rewind(NULL, 0);
+    ds4_session_free(s);
+
+    /* Text-only terminal rewind also preserves a reconstructible history. */
+    s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    ds4_tokens_push(&s->checkpoint, 100);
+    ds4_tokens_push(&s->checkpoint, 101);
+    s->checkpoint_valid = true;
+    ds4_session_rewind(s, 1);
+    assert(ds4_session_tokens(s)->len == 1);
+    assert(ds4_session_tokens(s)->v[0] == 100);
+    assert(ds4_session_rebase_vision_state(s, NULL, 0));
+    assert(!ds4_session_vision_prefix_matches(s, NULL, 0));
+    assert(ds4_session_common_prefix(s, &s->checkpoint) == 0);
     ds4_session_free(s);
 }
 

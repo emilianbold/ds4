@@ -440,7 +440,9 @@ bool ds4_session_vision_state_matches(const ds4_session *s,
                                       size_t image_count);
 /* Restore image positions from an independently authenticated live continuation
  * (for example, matching tool-call IDs). Checks every fingerprint and row count;
- * on failure, leaves spans unchanged. This does not verify the text history. */
+ * on failure, leaves spans unchanged. Retained history can be rebased after a
+ * rewind invalidates KV, provided its images are still entirely retained.
+ * This does not verify the text history or imply that the checkpoint is reusable. */
 bool ds4_session_rebase_vision_state(const ds4_session *s,
                                      ds4_vision_span *images, size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
