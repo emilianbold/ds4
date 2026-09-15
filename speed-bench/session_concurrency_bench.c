@@ -444,6 +444,10 @@ static bool verify_batch_matches_sequential(const bench_env *env,
                             a, (double)lb[a], b, (double)lb[b],
                             (double)lb[b] - (double)lb[a]);
                 }
+                if (compared) {
+                    printf("  logits so far: %llu of %llu differ, worst absolute %.3e\n",
+                           (unsigned long long)differing, (unsigned long long)compared, worst_abs);
+                }
                 free(la);
                 free(lb);
                 return false;
