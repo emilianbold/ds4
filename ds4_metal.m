@@ -50106,13 +50106,21 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
 static uint64_t g_qwen4_dense_mm_partials_bytes;
 
+/* Scratch for the k-split planes, allocated once and generously: the
+ * command buffer holds unretained references, so a scratch replaced while
+ * earlier dispatches of the same buffer still point at it is read after its
+ * release.  Growing it per request was what made wide splits look wrong. */
 static bool qwen4_dense_mm_partials_ensure(uint64_t bytes) {
     if (g_qwen4_dense_mm_partials && g_qwen4_dense_mm_partials_bytes >= bytes) return true;
-    ds4_gpu_tensor_free(g_qwen4_dense_mm_partials);
-    g_qwen4_dense_mm_partials_bytes = 0;
-    g_qwen4_dense_mm_partials = ds4_gpu_tensor_alloc(bytes);
+    if (g_qwen4_dense_mm_partials) {
+        fprintf(stderr, "ds4: Qwen3.8 k-split scratch of %.1f MiB cannot grow to %.1f MiB mid-batch\n",
+                ds4_gpu_mib(g_qwen4_dense_mm_partials_bytes), ds4_gpu_mib(bytes));
+        return false;
+    }
+    const uint64_t grow = bytes > (64u << 20) ? bytes : (64u << 20);
+    g_qwen4_dense_mm_partials = ds4_gpu_tensor_alloc(grow);
     if (!g_qwen4_dense_mm_partials) return false;
-    g_qwen4_dense_mm_partials_bytes = bytes;
+    g_qwen4_dense_mm_partials_bytes = grow;
     return true;
 }
 
@@ -50147,11 +50155,11 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         const uint32_t nk = (in_dim + 31u) / 32u;
         /* The worst logit difference against the unsplit path falls as the
          * split widens, as more and shorter accumulations should: 2.5e-3 at
-         * two splits, 8.4e-4 at thirteen.  At sixteen it jumps to 1.3 and
-         * stays there, which is not rounding - something in the split is
-         * wrong at that width and has not been found yet.  This default is
-         * the widest split measured clean; do not raise it without checking
-         * that difference again. */
+         * two splits, 8.4e-4 at thirteen.  Wider splits once looked wrong
+         * (a jump to 1.3): that was the scratch below being reallocated
+         * under a command buffer that still referenced it, not the split.
+         * Splits of 32 and 64 measure exact now and no faster, so the
+         * default stays. */
         const uint32_t target = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_KSPLIT_TILES", 128u, 1u, 4096u);
         const uint32_t want = tiles >= target ? 1u : (target + tiles - 1u) / tiles;
         n_split = want > nk / 4u ? (nk / 4u ? nk / 4u : 1u) : want;
