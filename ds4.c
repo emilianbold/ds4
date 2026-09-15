@@ -58132,15 +58132,18 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
      * height, not the eight rows the path was originally tuned with, because
      * below a full tile the trade inverts.
      *
-     * A decode batch never fills a tile, and there the tiled path wins only
-     * where the projection is too narrow to give the per-token kernel any
-     * parallelism - the hyper-connection down projections, 10240 wide and 320
-     * tall, are 96 of the calls in a step - and only because the k-split
-     * spreads their grid over the machine.
+     * A decode batch never fills a tile, and there the tiled path wins where
+     * the projection is too narrow to give the per-token kernel any
+     * parallelism, because the k-split spreads its grid over the machine:
+     * the hyper-connection down projections, 10240 wide and 320 tall, are 96
+     * of the calls in a step, and the F32 router and gate projections are
+     * another 120.  Q8 weights stay on the per-token kernel at every decode
+     * width: it reads the matrix once per four tokens, yet still beats the
+     * tile by 5% at sixteen rows.
      *
      * DS4_QWEN4_DENSE_MM_LEGACY restores the original policy for measurement. */
     const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
-    const uint32_t mm_min = legacy ? 8u : qwen4_env_threshold("DS4_QWEN4_DENSE_MM_MIN", 32u);
+    const uint32_t mm_min = legacy ? 8u : qwen4_env_threshold("DS4_QWEN4_DENSE_MM_MIN", 8u);
     const bool narrow_batch = !legacy && n_tok > 1u && w->type == DS4_TENSOR_F16 &&
         out_dim <= qwen4_env_threshold("DS4_QWEN4_DENSE_MM_NARROW_ROWS", 512u);
     if (((n_tok > mm_min && w->type == DS4_TENSOR_F32) || narrow_batch) &&
