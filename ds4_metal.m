@@ -48157,6 +48157,9 @@ enum {
     QWEN4_K_MOE_MM_DOWN_NAXC64,
     QWEN4_K_ROWS_F32_TO_F16,
     QWEN4_K_DENSE_MM,
+    QWEN4_K_DENSE_MM_REDUCE,
+    QWEN4_K_GDN_SCAN_ROWS,
+    QWEN4_K_CONV_STREAM_ROWS,
     QWEN4_K_HC_LO_ACT,
     QWEN4_K_HC_MIX_ROWS,
     QWEN4_K_VIS_PATCH_FINISH,
@@ -48244,6 +48247,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_mm_down_naxc64",
     "kernel_qwen4_rows_f32_to_f16",
     "kernel_qwen4_dense_mm",
+    "kernel_qwen4_dense_mm_reduce",
+    "kernel_qwen4_gdn_scan_rows",
+    "kernel_qwen4_conv_stream_rows",
     "kernel_qwen4_hc_lo_act",
     "kernel_qwen4_hc_mix_rows",
     "kernel_qwen4_vis_patch_finish",
@@ -48690,6 +48696,80 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
                           MTLSizeMake(head_dim, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
+static ds4_gpu_tensor *g_qwen4_gdn_slots;
+
+/* One decode step for every row of a batch against its own slot of the state
+ * pool.  The grid keeps the per-row kernel's shape and simd-group grouping, so
+ * each row's arithmetic is unchanged and the result is bit-identical; the rows
+ * merely share a dispatch long enough to reach steady state. */
+int ds4_gpu_qwen4_gdn_scan_rows_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state_pool,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const uint32_t *slots, uint32_t n_rows,
+        uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t state_stride, uint32_t qkv_stride, uint32_t out_stride) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (head_dim != 128u || n_rows == 0u || n_rows > 64u) return 0;
+
+    struct { uint32_t n_rows, n_k_head, n_v_head, head_dim, state_stride, qkv_stride, out_stride, pad0; } args =
+        { n_rows, n_k_head, n_v_head, head_dim, state_stride, qkv_stride, out_stride, 0 };
+
+    const uint64_t slot_bytes = (uint64_t)n_rows * sizeof(uint32_t);
+    if (!g_qwen4_gdn_slots) {
+        g_qwen4_gdn_slots = ds4_gpu_tensor_alloc(64u * sizeof(uint32_t));
+        if (!g_qwen4_gdn_slots) return 0;
+    }
+    if (ds4_gpu_tensor_write(g_qwen4_gdn_slots, 0, slots, slot_bytes) == 0) return 0;
+
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], qkv, (uint64_t)n_rows * qkv_stride * sizeof(float), "gdn rows qkv") ||
+        !qwen4_bind_tensor(&b[1], ga, (uint64_t)n_rows * n_v_head * sizeof(float), "gdn rows decay") ||
+        !qwen4_bind_tensor(&b[2], gb, (uint64_t)n_rows * n_v_head * sizeof(float), "gdn rows beta") ||
+        !qwen4_bind_tensor(&b[3], state_pool, 0, "gdn rows state pool") ||
+        !qwen4_bind_tensor(&b[4], out, (uint64_t)n_rows * out_stride * sizeof(float), "gdn rows output") ||
+        !qwen4_bind_tensor(&b[5], g_qwen4_gdn_slots, slot_bytes, "gdn rows slots")) {
+        return 0;
+    }
+    /* Simd groups own independent value rows, so their grouping changes the
+     * dispatch shape without touching a row's recurrent arithmetic. */
+    const uint32_t nsg = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_BATCH_GDN_NSG", 1u, 1u, 8u);
+    return qwen4_dispatch(QWEN4_K_GDN_SCAN_ROWS, &args, sizeof(args), b, 6,
+                          MTLSizeMake((head_dim + 4u * nsg - 1u) / (4u * nsg), n_v_head, n_rows),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* One decode token per batch row, each against its own slot of the history
+ * pool; see kernel_qwen4_conv_stream_rows. */
+int ds4_gpu_qwen4_conv_stream_rows_tensor(
+        ds4_gpu_tensor *x, ds4_gpu_tensor *hist_pool,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const uint32_t *slots, uint32_t n_rows, uint32_t n_channels,
+        uint32_t conv_kernel, uint32_t state_stride, uint32_t x_stride, int apply_silu) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (n_rows == 0u || n_rows > 64u || conv_kernel < 2u || conv_kernel > 4u) return 0;
+
+    struct { uint32_t n_rows, n_channels, conv_kernel, apply_silu, state_stride, x_stride, pad0, pad1; } args =
+        { n_rows, n_channels, conv_kernel, apply_silu ? 1u : 0u, state_stride, x_stride, 0, 0 };
+
+    const uint64_t slot_bytes = (uint64_t)n_rows * sizeof(uint32_t);
+    if (!g_qwen4_gdn_slots) {
+        g_qwen4_gdn_slots = ds4_gpu_tensor_alloc(64u * sizeof(uint32_t));
+        if (!g_qwen4_gdn_slots) return 0;
+    }
+    if (ds4_gpu_tensor_write(g_qwen4_gdn_slots, 0, slots, slot_bytes) == 0) return 0;
+
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], x, (uint64_t)n_rows * x_stride * sizeof(float), "conv rows x") ||
+        !qwen4_bind_tensor(&b[1], hist_pool, 0, "conv rows history pool") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset,
+                           (uint64_t)n_channels * conv_kernel * sizeof(float), "conv rows weight") ||
+        !qwen4_bind_tensor(&b[3], g_qwen4_gdn_slots, slot_bytes, "conv rows slots")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_CONV_STREAM_ROWS, &args, sizeof(args), b, 4,
+                          MTLSizeMake((n_channels + 255u) / 256u, n_rows, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
@@ -48977,14 +49057,11 @@ int ds4_gpu_qwen4_idx_expand_tensor(
 }
 
 /* keys per split of the partial-softmax decode path (DS4_QWEN4_ATTN_SPLIT_KEYS overrides) */
+/* Read per call, not cached, so an A/B harness can switch it per step. */
 static uint32_t qwen4_attn_split_keys(void) {
-    static uint32_t keys;
-    if (!keys) {
-        const char *env = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
-        const int v = env ? atoi(env) : 0;
-        keys = v > 0 ? (uint32_t)v : 32u;
-    }
-    return keys;
+    const char *env = getenv("DS4_QWEN4_ATTN_SPLIT_KEYS");
+    const int v = env ? atoi(env) : 0;
+    return v > 0 ? (uint32_t)v : 32u;
 }
 
 uint64_t ds4_gpu_qwen4_attn_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
@@ -49699,14 +49776,27 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
                           MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
+static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
+static uint64_t g_qwen4_dense_mm_partials_bytes;
+
+static bool qwen4_dense_mm_partials_ensure(uint64_t bytes) {
+    if (g_qwen4_dense_mm_partials && g_qwen4_dense_mm_partials_bytes >= bytes) return true;
+    ds4_gpu_tensor_free(g_qwen4_dense_mm_partials);
+    g_qwen4_dense_mm_partials_bytes = 0;
+    g_qwen4_dense_mm_partials = ds4_gpu_tensor_alloc(bytes);
+    if (!g_qwen4_dense_mm_partials) return false;
+    g_qwen4_dense_mm_partials_bytes = bytes;
+    return true;
+}
+
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
     const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
-    struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, pad0, pad1, pad2; } args =
-        { n_tokens, in_dim, out_rows, weight_type, row_bytes, 0, 0, 0 };
+    struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
+        { n_tokens, in_dim, out_rows, weight_type, row_bytes, 1, 0, 0 };
     qwen4_bind b[3];
     if (n_tokens == 0 || row_bytes == 0 || (weight_type != 0u && weight_type != 1u && weight_type != 8u) ||
         (weight_type == 8u && (in_dim % 32) != 0) || (in_dim % 8) != 0 || out_rows == 0) {
@@ -49720,8 +49810,50 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         !qwen4_bind_tensor(&b[2], out, (uint64_t)n_tokens * out_rows * sizeof(float), "dense mm output")) {
         return 0;
     }
-    return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
-                          MTLSizeMake((out_rows + 31) / 32, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);
+    /* A projection whose output is narrow gives this grid only a few
+     * threadgroups; split k until the machine has work, then sum the planes.
+     * The split is chosen so the partials stay small and every threadgroup
+     * still walks enough k to amortize its staging. */
+    const uint32_t tiles = (out_rows + 31u) / 32u;
+    uint32_t n_split = 1u;
+    if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
+        const uint32_t nk = (in_dim + 31u) / 32u;
+        /* The worst logit difference against the unsplit path falls as the
+         * split widens, as more and shorter accumulations should: 2.5e-3 at
+         * two splits, 8.4e-4 at thirteen.  At sixteen it jumps to 1.3 and
+         * stays there, which is not rounding - something in the split is
+         * wrong at that width and has not been found yet.  This default is
+         * the widest split measured clean; do not raise it without checking
+         * that difference again. */
+        const uint32_t target = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_KSPLIT_TILES", 128u, 1u, 4096u);
+        const uint32_t want = tiles >= target ? 1u : (target + tiles - 1u) / tiles;
+        n_split = want > nk / 4u ? (nk / 4u ? nk / 4u : 1u) : want;
+        if (n_split > 64u) n_split = 64u;
+    }
+    args.n_split = n_split;
+    if (n_split <= 1u) {
+        return qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), b, 3,
+                              MTLSizeMake(tiles, (n_tokens + 31) / 32, 1), MTLSizeMake(128, 1, 1), 0);
+    }
+
+    const uint64_t plane = (uint64_t)n_tokens * out_rows * sizeof(float);
+    if (!qwen4_dense_mm_partials_ensure(plane * n_split)) return 0;
+    qwen4_bind bp[3];
+    bp[0] = b[0];
+    bp[1] = b[1];
+    if (!qwen4_bind_tensor(&bp[2], g_qwen4_dense_mm_partials, plane * n_split, "dense mm partials")) {
+        return 0;
+    }
+    if (!qwen4_dispatch(QWEN4_K_DENSE_MM, &args, sizeof(args), bp, 3,
+                        MTLSizeMake(tiles, (n_tokens + 31) / 32, n_split), MTLSizeMake(128, 1, 1), 0)) {
+        return 0;
+    }
+    qwen4_bind br[2];
+    br[0] = bp[2];
+    br[1] = b[2];
+    const uint64_t n = (uint64_t)n_tokens * out_rows;
+    return qwen4_dispatch(QWEN4_K_DENSE_MM_REDUCE, &args, sizeof(args), br, 2,
+                          MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1), 0);
 }
 
 /* Vision tower (metal/qwen4_vision.metal). */

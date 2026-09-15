@@ -48,6 +48,14 @@ Add `--mtp` for speculative decoding using the built-in MTP weights.
 `qwen3.8-flash-next-reasoner` aliases. Tool calls use the native
 `<tool_call><function=...><parameter=...>` format.
 
+`ds4-server --batched-session N` decodes the slots together: everything that
+only reads weights runs once for the whole batch, while the delta-net
+recurrence, the attention caches and the n-gram convolution stay per session.
+The slots also share one prefill workspace, so an extra slot costs its caches
+rather than another few GiB of transients. As with the other natively batched
+models, grouping changes the order of floating point reductions, so a batched
+reply can differ from the same prompt decoded alone.
+
 Disk KV checkpoints include recurrent state. Rewinding to an earlier position
 replays the retained prefix on the next evaluation. The native context is
 262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for

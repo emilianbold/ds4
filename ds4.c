@@ -42291,6 +42291,16 @@ struct ds4_engine {
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
+    /* Qwen keeps the same idea in its own graph shape; the first session
+     * allocates the arena and hands ownership here. */
+    struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
+    /* Recurrent state for every slot of a layer in one tensor, so a batched
+     * decode can advance all of its rows in a single dispatch instead of one
+     * per session.  Sessions hold views into it and a slot index. */
+    ds4_gpu_tensor *qwen4_lin_state_pool[DS4_MAX_LAYER];
+    ds4_gpu_tensor *qwen4_lin_hist_pool[DS4_MAX_LAYER];
+    uint32_t qwen4_pool_slots;
+    uint64_t qwen4_pool_used;
 #endif
 
     /* Wave-2 multi-GPU placement scaffolding: optional multi-GPU placement
@@ -57513,13 +57523,35 @@ static const ds4_vision_span *qwen4_fake_spans(size_t *count) {
  * (f16) + raw indexer keys + pooled block keys, PLE conv history.
  * --------------------------------------------------------------------- */
 
-typedef struct {
+/* Transients that every forward pass recomputes, sized by cap_tokens and the
+ * block cap.  Nothing here survives a call, so sessions can share one arena
+ * while the engine serializes their forwards.  Everything else stays private:
+ * the KV, indexer and block caches, the GDN and PLE recurrent history, the MTP
+ * snapshots, the rope positions, and the logits a caller reads back.
+ *
+ * Sharing holds only while one forward runs at a time.  Encoding two sessions
+ * into the same command batch would let the second overwrite the first's
+ * transients before the GPU read them.  A batched Qwen decode must therefore
+ * be one forward over several rows, which is the shape these buffers already
+ * have, and not two forwards sharing an arena. */
+#define DS4_QWEN4_SCRATCH_FIELDS(X) \
+    X(R) X(xn) X(lo) X(inj) X(inj_alt) X(mixed) X(blk) X(qkv) X(z) X(ga) \
+    X(gb) X(lin_o) X(ple_emb) X(ple_key) X(ple_val) X(ple_gated) X(ple_normed) \
+    X(qg) X(kp) X(vp) X(iq) X(ik) X(q) X(gate) X(iqn) X(attn_o) \
+    X(score) X(tile_max) X(sel_blocks) X(sel_tokens) X(n_sel) X(attn_part) \
+    X(router) X(selected) X(weights) X(mid) X(part) X(sh_gate_logit) \
+    X(moe_lists) X(moe_counts) X(sh_gate) X(sh_up) X(sh_mid) X(sh_out) \
+    X(hc_u) X(hc_lo_act)
+
+typedef struct ds4_qwen4_gpu_graph {
     uint32_t ctx_cap;
     uint32_t pos;
     uint32_t cap_tokens;
     uint32_t k_blocks;
     uint32_t n_block_cap;
     uint32_t sel_stride;
+    /* false when the scratch above is borrowed from the engine's arena */
+    bool owns_scratch;
     ds4_gpu_tensor *R, *xn, *lo, *inj, *mixed, *blk;
     ds4_gpu_tensor *qkv, *z, *ga, *gb, *lin_o;
     ds4_gpu_tensor *ple_emb, *ple_key, *ple_val, *ple_gated, *ple_normed, *ple_hist;
@@ -57529,6 +57561,9 @@ typedef struct {
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
     ds4_gpu_tensor *moe_lists, *moe_counts, *sh_gate, *sh_up, *sh_mid, *sh_out, *hc_u, *hc_lo_act;
     ds4_gpu_tensor *logits;
+    /* Arena only: one logit row per batch member, grown on demand. */
+    ds4_gpu_tensor *batch_logits;
+    uint32_t batch_logit_rows;
     ds4_gpu_tensor *layer_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_lin_hist[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_k_cache[DS4_MAX_LAYER];
@@ -57680,16 +57715,27 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
 static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
     ds4_gpu_tensor **all[] = {
-        &g->R, &g->xn, &g->lo, &g->inj, &g->mixed, &g->blk, &g->qkv, &g->z, &g->ga, &g->gb, &g->lin_o,
-        &g->ple_emb, &g->ple_key, &g->ple_val, &g->ple_gated, &g->ple_normed, &g->ple_hist,
-        &g->qg, &g->kp, &g->vp, &g->iq, &g->ik, &g->q, &g->gate, &g->iqn, &g->attn_o,
-        &g->score, &g->tile_max, &g->sel_blocks, &g->sel_tokens, &g->n_sel, &g->attn_part,
-        &g->router, &g->selected, &g->weights, &g->mid, &g->part, &g->sh_gate_logit, &g->logits,
-        &g->moe_lists, &g->moe_counts, &g->sh_gate, &g->sh_up, &g->sh_mid, &g->sh_out, &g->hc_u, &g->hc_lo_act,
-        &g->inj_alt, &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
+        &g->ple_hist, &g->logits,
+        &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
         &g->draft_head, &g->steer_dirs,
     };
+    if (g->owns_scratch) {
+        ds4_gpu_tensor **scratch[] = {
+#define QWEN4_SCRATCH_PTR(field_) &g->field_,
+            DS4_QWEN4_SCRATCH_FIELDS(QWEN4_SCRATCH_PTR)
+#undef QWEN4_SCRATCH_PTR
+        };
+        for (size_t i = 0; i < sizeof(scratch) / sizeof(scratch[0]); i++) {
+            ds4_gpu_tensor_free(*scratch[i]);
+            *scratch[i] = NULL;
+        }
+        ds4_gpu_tensor_free(g->batch_logits);
+        g->batch_logits = NULL;
+        g->batch_logit_rows = 0;
+        free(g->host_row);
+    }
+    g->host_row = NULL;
     free(g->host_pos3);
     free(g->draft_ids);
     g->draft_ids = NULL;
@@ -57712,9 +57758,82 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->snap0_lin_state[il]);
         ds4_gpu_tensor_free(g->snap0_lin_hist[il]);
     }
-    free(g->host_row);
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
+}
+
+/* One tensor per linear layer holding every slot's recurrent state.  Sized
+ * from the session count the engine was opened for, so a server's slots are
+ * pooled and an ad-hoc extra session simply keeps private state. */
+static bool qwen4_state_pool_ensure(ds4_engine *e, uint32_t slots) {
+    if (e->qwen4_pool_slots) return true;
+    if (slots < 2u || slots > 64u) return false;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
+    const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM * sizeof(float);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_qwen4_layer_is_linear(il)) continue;
+        e->qwen4_lin_state_pool[il] = ds4_gpu_tensor_alloc(state_bytes * slots);
+        e->qwen4_lin_hist_pool[il] = ds4_gpu_tensor_alloc(hist_bytes * slots);
+        if (!e->qwen4_lin_state_pool[il] || !e->qwen4_lin_hist_pool[il]) {
+            for (uint32_t j = 0; j <= il; j++) {
+                ds4_gpu_tensor_free(e->qwen4_lin_state_pool[j]);
+                ds4_gpu_tensor_free(e->qwen4_lin_hist_pool[j]);
+                e->qwen4_lin_state_pool[j] = NULL;
+                e->qwen4_lin_hist_pool[j] = NULL;
+            }
+            return false;
+        }
+    }
+    e->qwen4_pool_slots = slots;
+    e->qwen4_pool_used = 0;
+    return true;
+}
+
+static int qwen4_state_pool_take(ds4_engine *e) {
+    for (uint32_t i = 0; i < e->qwen4_pool_slots; i++) {
+        if (!(e->qwen4_pool_used & (UINT64_C(1) << i))) {
+            e->qwen4_pool_used |= UINT64_C(1) << i;
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static void qwen4_state_pool_free(ds4_engine *e) {
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(e->qwen4_lin_state_pool[il]);
+        ds4_gpu_tensor_free(e->qwen4_lin_hist_pool[il]);
+        e->qwen4_lin_state_pool[il] = NULL;
+        e->qwen4_lin_hist_pool[il] = NULL;
+    }
+    e->qwen4_pool_slots = 0;
+    e->qwen4_pool_used = 0;
+}
+
+/* Move the transients out of the first session and into the engine, which
+ * then outlives every session and lends them to the next ones.  The session
+ * keeps using the same buffers; only ownership moves. */
+static void qwen4_graph_transfer_scratch(ds4_qwen4_gpu_graph *dst, ds4_qwen4_gpu_graph *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->cap_tokens = src->cap_tokens;
+    dst->n_block_cap = src->n_block_cap;
+    dst->k_blocks = src->k_blocks;
+    dst->sel_stride = src->sel_stride;
+#define QWEN4_TAKE(field_) dst->field_ = src->field_;
+    DS4_QWEN4_SCRATCH_FIELDS(QWEN4_TAKE)
+#undef QWEN4_TAKE
+    dst->host_row = src->host_row;
+    dst->owns_scratch = true;
+    src->owns_scratch = false;
+}
+
+static uint64_t qwen4_graph_scratch_bytes(const ds4_qwen4_gpu_graph *g) {
+    uint64_t total = 0;
+#define QWEN4_COUNT(field_) total += ds4_gpu_tensor_bytes(g->field_);
+    DS4_QWEN4_SCRATCH_FIELDS(QWEN4_COUNT)
+#undef QWEN4_COUNT
+    return total;
 }
 
 static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
@@ -57723,8 +57842,18 @@ static ds4_gpu_tensor *qwen4_graph_alloc_f32(uint64_t n) {
     return t;
 }
 
+/* shared borrows the engine arena for the transients; NULL allocates private
+ * ones.  A borrowing graph must fit inside the arena it borrows: the caller
+ * checks cap_tokens and n_block_cap before passing one.
+ *
+ * state_pool/hist_pool, when given, hold every slot's recurrent state in one
+ * tensor per layer and this graph takes slot's view of it.  A batched decode
+ * then advances all its rows with one dispatch; without a pool each session
+ * keeps its own tensors and the batch falls back to a dispatch per row. */
 static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint32_t ctx_cap, uint32_t cap_tokens,
-                              bool mtp) {
+                              bool mtp, const ds4_qwen4_gpu_graph *shared,
+                              ds4_gpu_tensor *const *state_pool,
+                              ds4_gpu_tensor *const *hist_pool, uint32_t slot) {
     memset(g, 0, sizeof(*g));
     if (!qwen4_graph_weights_supported(w)) return false;
     mtp = mtp && DS4_N_NEXTN_PREDICT != 0;
@@ -57748,7 +57877,15 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     g->sel_stride = g->k_blocks * 4u + 4u;
 
     bool ok = true;
+    g->owns_scratch = shared == NULL;
 #define QWEN4_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
+    if (shared) {
+#define QWEN4_BORROW(field_) g->field_ = shared->field_;
+        DS4_QWEN4_SCRATCH_FIELDS(QWEN4_BORROW)
+#undef QWEN4_BORROW
+        g->host_row = shared->host_row;
+        goto private_state;
+    }
     QWEN4_ALLOC(R, T * hc_dim);
     QWEN4_ALLOC(xn, T * hc_dim);
     QWEN4_ALLOC(lo, T * DS4_N_HC_LOWRANK);
@@ -57766,7 +57903,6 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(ple_val, T * E);
     QWEN4_ALLOC(ple_gated, T * hc_dim);
     QWEN4_ALLOC(ple_normed, T * hc_dim);
-    QWEN4_ALLOC(ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     QWEN4_ALLOC(qg, T * 2u * q_dim);
     QWEN4_ALLOC(kp, T * kv_dim);
     QWEN4_ALLOC(vp, T * kv_dim);
@@ -57796,6 +57932,12 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     QWEN4_ALLOC(sh_out, T * E);
     QWEN4_ALLOC(hc_u, T * hc_dim);
     QWEN4_ALLOC(hc_lo_act, T * DS4_N_HC_LOWRANK);
+    g->host_row = xmalloc(T * hc_dim * sizeof(float));
+
+private_state:
+    /* The PLE conv history carries across calls and the logits belong to the
+     * caller that reads them back, so neither can be shared. */
+    QWEN4_ALLOC(ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     QWEN4_ALLOC(logits, (uint64_t)g->n_logit_rows * DS4_N_VOCAB);
     if (mtp) {
         QWEN4_ALLOC(mtp_e, 3u * E);
@@ -57807,10 +57949,19 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
         QWEN4_ALLOC(snap_ple_hist, (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * hc_dim);
     }
 #undef QWEN4_ALLOC
+    const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
+    const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (ds4_qwen4_layer_is_linear(il)) {
-            g->layer_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
-            g->layer_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+            if (state_pool && hist_pool) {
+                g->layer_lin_state[il] = ds4_gpu_tensor_view(state_pool[il],
+                                                             (uint64_t)slot * state_bytes, state_bytes);
+                g->layer_lin_hist[il] = ds4_gpu_tensor_view(hist_pool[il],
+                                                            (uint64_t)slot * hist_bytes, hist_bytes);
+            } else {
+                g->layer_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
+                g->layer_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+            }
             ok = ok && g->layer_lin_state[il] && g->layer_lin_hist[il];
             if (ok && mtp) {
                 g->snap_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
@@ -57828,7 +57979,6 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     g->pos3 = qwen4_graph_alloc_f32((uint64_t)ctx_cap * 4u);
     ok = ok && g->pos3;
     g->host_pos3 = xmalloc(T * 4u * sizeof(uint32_t));
-    g->host_row = xmalloc(T * hc_dim * sizeof(float));
     g->host_logits = xmalloc((uint64_t)g->n_logit_rows * DS4_N_VOCAB * sizeof(float));
     if (!ok) {
         fprintf(stderr, "ds4: Qwen3.8 graph allocation failed (ctx %u)\n", ctx_cap);
@@ -57949,6 +58099,14 @@ static void qwen4_graph_reset(ds4_qwen4_gpu_graph *g) {
 
 /* rows > 0 limits the product to the leading rows of w (a contiguous prefix
  * of the weight buffer); the per-row arithmetic is unchanged. */
+static uint32_t qwen4_env_threshold(const char *name, uint32_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    const unsigned long v = strtoul(env, &end, 10);
+    return (end != env && *end == '\0' && v <= 65536ul) ? (uint32_t)v : fallback;
+}
+
 static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                             const ds4_gpu_tensor *x, uint32_t n_tok, uint64_t rows) {
     const uint64_t in_dim = w->dim[0], full_dim = w->ndim >= 2 ? w->dim[1] : 1u;
@@ -57961,9 +58119,28 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset,
                                            w->type, n_tok, (uint32_t)in_dim, (uint32_t)out_dim);
 #else
-    /* prefill batches of f32 weights: DS4's dense path for that type runs per
-     * token, the tiled GEMM reads each weight once per 32 tokens */
-    if (n_tok > 8u && w->type == DS4_TENSOR_F32 && (in_dim % 32) == 0) {
+
+    /* Two separate reasons to leave the per-type dense paths below, which read
+     * the weight matrix once per token.
+     *
+     * A prefill chunk fills the tiled GEMM's 32-token tiles, so reading each
+     * weight once per tile is simply cheaper; the threshold is that tile
+     * height, not the eight rows the path was originally tuned with, because
+     * below a full tile the trade inverts.
+     *
+     * A decode batch never fills a tile, and there the tiled path wins only
+     * where the projection is too narrow to give the per-token kernel any
+     * parallelism - the hyper-connection down projections, 10240 wide and 320
+     * tall, are 96 of the calls in a step - and only because the k-split
+     * spreads their grid over the machine.
+     *
+     * DS4_QWEN4_DENSE_MM_LEGACY restores the original policy for measurement. */
+    const bool legacy = getenv("DS4_QWEN4_DENSE_MM_LEGACY") != NULL;
+    const uint32_t mm_min = legacy ? 8u : qwen4_env_threshold("DS4_QWEN4_DENSE_MM_MIN", 32u);
+    const bool narrow_batch = !legacy && n_tok > 1u && w->type == DS4_TENSOR_F16 &&
+        out_dim <= qwen4_env_threshold("DS4_QWEN4_DENSE_MM_NARROW_ROWS", 512u);
+    if (((n_tok > mm_min && w->type == DS4_TENSOR_F32) || narrow_batch) &&
+        (in_dim % 32) == 0) {
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->type, n_tok,
                                            (uint32_t)in_dim, (uint32_t)out_dim);
         if (rc) return true;
@@ -58091,7 +58268,8 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                            inject ? inject->abs_offset : 0, inject ? inject->type : DS4_TENSOR_F32,
                                            T, DS4_N_EMBD, DS4_N_HC, inject ? DS4_N_HC : 0u, DS4_RMS_EPS) &&
               qwen4_gemv(g->lo, m, down, g->xn, T);
-    if (T > 8u && up->type != DS4_TENSOR_Q8_0) {
+    if (T > qwen4_env_threshold("DS4_QWEN4_HC_MIX_GEMM_MIN", 8u) &&
+        up->type != DS4_TENSOR_Q8_0) {
         /* prefill: the up projection as a GEMM over the activated low-rank rows */
         return ok && ds4_gpu_qwen4_hc_lo_act_tensor(g->hc_lo_act, g->lo, T, DS4_N_HC, DS4_N_HC_LOWRANK) &&
                qwen4_gemv(g->hc_u, m, up, g->hc_lo_act, T) &&
@@ -58328,7 +58506,14 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * (weights read once per 32 tokens) and run the shared expert as dense
      * GEMMs; decode keeps the per-(token, slot) row kernels with the shared
      * expert as an extra slot. */
-    const bool mm = T > 8u && (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
+    /* The tiled expert GEMM pays when each expert sees enough tokens to fill a
+     * tile: a prefill chunk of 8192 rows gives every one of the 512 experts
+     * about 160 of them.  A decode batch does not - sixteen rows spread ten
+     * choices each over 512 experts, so an expert averages a third of a token
+     * and the tiles run nearly empty.  Above this row count the GEMM wins;
+     * below it the per-token expert path does, by 4% at sixteen rows. */
+    const bool mm = T > qwen4_env_threshold("DS4_QWEN4_MOE_MM_MIN", 64u) &&
+        (DS4_N_EMBD % 64u) == 0 && (DS4_N_FF_EXP % 64u) == 0 &&
         qwen4_expert_type_has_mm(l->ffn_gate_exps->type) &&
         l->ffn_up_exps->type == l->ffn_gate_exps->type &&
         qwen4_expert_type_has_mm(l->ffn_down_exps->type) &&
@@ -58952,7 +59137,7 @@ static int generate_qwen4_metal_argmax(
         return 1;
     }
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false)) {
+    if (!qwen4_graph_alloc(g, weights, (uint32_t)ctx_size, qwen4_prefill_chunk_tokens((uint32_t)ctx_size), false, NULL, NULL, NULL, 0)) {
         free(g);
         return 1;
     }
@@ -59957,6 +60142,7 @@ struct ds4_session {
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_qwen4_gpu_graph qwen4_graph;
     bool qwen4_graph_ready;
+    int qwen4_slot;   /* -1 when the session holds private recurrent state */
     bool qwen4_rewound;
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
@@ -67446,7 +67632,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false)) {
+        if (!qwen4_graph_alloc(g, weights, 8192u, 128u, false, NULL, NULL, NULL, 0)) {
             free(g);
             fclose(lf);
             return 1;
@@ -67584,7 +67770,7 @@ static int qwen4_first_token_test(const ds4_model *model, const ds4_vocab *vocab
             return 1;
         }
         ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL)) {
+        if (!qwen4_graph_alloc(g, weights, n_seq + 4u, chunk, draft != NULL, NULL, NULL, NULL, 0)) {
             free(g);
             return 1;
         }
@@ -72351,6 +72537,14 @@ void ds4_engine_close(ds4_engine *e) {
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
 #ifndef DS4_NO_GPU
+#ifdef DS4_HAS_QWEN4_METAL
+    qwen4_state_pool_free(e);
+    if (e->qwen4_shared_workspace) {
+        qwen4_graph_free(e->qwen4_shared_workspace);
+        free(e->qwen4_shared_workspace);
+        e->qwen4_shared_workspace = NULL;
+    }
+#endif
     if (e->shared_prefill_workspace_ready) {
         metal_graph_free_prefill_workspace(&e->shared_prefill_workspace);
         e->shared_prefill_workspace_ready = false;
@@ -72592,15 +72786,47 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         }
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
-        if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
+        /* Every slot of a batched server has the same shape, so one arena of
+         * transients serves them all and each extra session then costs only
+         * its own caches.  A session that would need a wider arena keeps
+         * private transients instead of growing the shared one. */
+        const uint32_t block_cap = (uint32_t)ctx_size / 4u + 1u;
+        const ds4_qwen4_gpu_graph *shared =
+            e->share_session_prefill_workspace && e->qwen4_shared_workspace &&
+            e->qwen4_shared_workspace->cap_tokens >= cap_tokens &&
+            e->qwen4_shared_workspace->n_block_cap >= block_cap
+                ? e->qwen4_shared_workspace : NULL;
+        s->qwen4_slot = -1;
+        if (e->share_session_prefill_workspace && !e->glm_mtp &&
+            getenv("DS4_QWEN4_NO_STATE_POOL") == NULL &&
+            qwen4_state_pool_ensure(e, (uint32_t)(e->placement_session_count_hint > 0
+                                                  ? e->placement_session_count_hint : 0))) {
+            s->qwen4_slot = qwen4_state_pool_take(e);
+        }
+        if (!qwen4_graph_alloc(&s->qwen4_graph, &e->weights, (uint32_t)ctx_size, cap_tokens,
+                               e->glm_mtp, shared,
+                               s->qwen4_slot >= 0 ? e->qwen4_lin_state_pool : NULL,
+                               s->qwen4_slot >= 0 ? e->qwen4_lin_hist_pool : NULL,
+                               s->qwen4_slot >= 0 ? (uint32_t)s->qwen4_slot : 0u)) {
+            if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             free(s);
             return 1;
+        }
+        if (e->share_session_prefill_workspace && !e->qwen4_shared_workspace) {
+            e->qwen4_shared_workspace = xcalloc(1, sizeof(*e->qwen4_shared_workspace));
+            const uint64_t arena = qwen4_graph_scratch_bytes(&s->qwen4_graph);
+            qwen4_graph_transfer_scratch(e->qwen4_shared_workspace, &s->qwen4_graph);
+            fprintf(stderr,
+                    "ds4: shared Qwen3.8 session transients: cap=%u, %.2f GiB once; "
+                    "each further session costs its caches only\n",
+                    cap_tokens, (double)arena / (1024.0 * 1024.0 * 1024.0));
         }
         qwen4_graph_reset(&s->qwen4_graph);
         if (!qwen4_graph_load_steering(&s->qwen4_graph,
                                        e->directional_steering_file,
                                        e->directional_steering_attn_scale,
                                        e->directional_steering_ffn_scale)) {
+            if (s->qwen4_slot >= 0) e->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             qwen4_graph_free(&s->qwen4_graph);
             free(s);
             return 1;
@@ -72967,6 +73193,9 @@ void ds4_session_free(ds4_session *s) {
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
             }
             free(s->qwen4_verify_logits);
+            if (s->qwen4_slot >= 0 && s->engine) {
+                s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
+            }
             qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
@@ -77838,6 +78067,437 @@ static bool ds41_sessions_batch_supported(ds4_decode_item *items, int count,
 
 #endif
 
+#ifdef DS4_HAS_QWEN4_METAL
+/* ------------------------------------------------------------------------
+ * Native session batching for Qwen3.8.
+ *
+ * A decode step is dominated by reading weights, not by arithmetic: one token
+ * walks 48 layers of dense projections plus eleven of five hundred experts,
+ * and every row of a batch wants the same bytes.  So everything that only
+ * reads weights runs once for the whole batch, and only the kernels that touch
+ * a session's own state run per row: the delta-net recurrence, the attention
+ * caches and their block index, and the PLE convolution history.
+ *
+ * This is the split GLM 5.3 already uses in
+ * glm53_graph_encode_native_session_batch.  Qwen needs no new kernels for the
+ * shared half, because every one of them already takes a row count: that is
+ * how prefill chunks work, and a decode batch is the same shape with the rows
+ * belonging to different sessions.
+ *
+ * The batch runs in the engine's shared arena, which is also why sharing is
+ * required rather than merely helpful: the single-row kernels need this row's
+ * slice of the transients beside this session's own caches, and a
+ * shared-arena session graph is already exactly that.
+ * --------------------------------------------------------------------- */
+
+enum { QWEN4_BATCH_MAX_ROWS = 64 };
+
+typedef struct {
+    ds4_gpu_tensor *R, *ple_gated, *ple_normed;
+    ds4_gpu_tensor *qkv, *ga, *gb, *lin_o;
+    ds4_gpu_tensor *qg, *kp, *vp, *iq, *ik, *q, *gate, *iqn, *attn_o;
+} qwen4_batch_row;
+
+static ds4_gpu_tensor *qwen4_row_view(ds4_gpu_tensor *base, uint32_t row, uint64_t values) {
+    return ds4_gpu_tensor_view(base, (uint64_t)row * values * sizeof(float),
+                               values * sizeof(float));
+}
+
+static void qwen4_batch_rows_free(qwen4_batch_row *rows, int count) {
+    if (!rows) return;
+    for (int i = 0; i < count; i++) {
+        ds4_gpu_tensor **all[] = {
+            &rows[i].R, &rows[i].ple_gated, &rows[i].ple_normed,
+            &rows[i].qkv, &rows[i].ga, &rows[i].gb, &rows[i].lin_o,
+            &rows[i].qg, &rows[i].kp, &rows[i].vp, &rows[i].iq, &rows[i].ik,
+            &rows[i].q, &rows[i].gate, &rows[i].iqn, &rows[i].attn_o,
+        };
+        for (size_t j = 0; j < sizeof(all) / sizeof(all[0]); j++) {
+            ds4_gpu_tensor_free(*all[j]);
+            *all[j] = NULL;
+        }
+    }
+}
+
+/* Built once per batch rather than per layer: a view is a tracked allocation,
+ * and 48 layers would spend more on making them than on the dispatches they
+ * serve. */
+static bool qwen4_batch_rows_build(qwen4_batch_row *rows, int count,
+                                   const ds4_qwen4_gpu_graph *g) {
+    const uint64_t hc_dim = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t iq_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    memset(rows, 0, (size_t)count * sizeof(rows[0]));
+    for (int i = 0; i < count; i++) {
+        const uint32_t r = (uint32_t)i;
+        rows[i].R = qwen4_row_view(g->R, r, hc_dim);
+        rows[i].ple_gated = qwen4_row_view(g->ple_gated, r, hc_dim);
+        rows[i].ple_normed = qwen4_row_view(g->ple_normed, r, hc_dim);
+        rows[i].qkv = qwen4_row_view(g->qkv, r, DS4_N_LIN_CONV_DIM);
+        rows[i].ga = qwen4_row_view(g->ga, r, DS4_N_LIN_V_HEAD);
+        rows[i].gb = qwen4_row_view(g->gb, r, DS4_N_LIN_V_HEAD);
+        rows[i].lin_o = qwen4_row_view(g->lin_o, r, v_dim);
+        rows[i].qg = qwen4_row_view(g->qg, r, 2u * q_dim);
+        rows[i].kp = qwen4_row_view(g->kp, r, kv_dim);
+        rows[i].vp = qwen4_row_view(g->vp, r, kv_dim);
+        rows[i].iq = qwen4_row_view(g->iq, r, iq_dim);
+        rows[i].ik = qwen4_row_view(g->ik, r, DS4_N_INDEXER_HEAD_DIM);
+        rows[i].q = qwen4_row_view(g->q, r, q_dim);
+        rows[i].gate = qwen4_row_view(g->gate, r, q_dim);
+        rows[i].iqn = qwen4_row_view(g->iqn, r, iq_dim);
+        rows[i].attn_o = qwen4_row_view(g->attn_o, r, q_dim);
+        if (!rows[i].R || !rows[i].ple_gated || !rows[i].ple_normed ||
+            !rows[i].qkv || !rows[i].ga || !rows[i].gb || !rows[i].lin_o ||
+            !rows[i].qg || !rows[i].kp || !rows[i].vp || !rows[i].iq ||
+            !rows[i].ik || !rows[i].q || !rows[i].gate || !rows[i].iqn ||
+            !rows[i].attn_o) {
+            qwen4_batch_rows_free(rows, count);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* This session's graph already points at the shared arena, so a copy of it
+ * with this row's views substituted is precisely what the single-row kernels
+ * want: this session's caches and positions, this row's slice of the
+ * transients.  The copy is a snapshot, so g->pos still reads the position the
+ * batch started from. */
+static void qwen4_batch_row_graph(ds4_qwen4_gpu_graph *out, ds4_session *s,
+                                  const qwen4_batch_row *v) {
+    *out = s->qwen4_graph;
+    out->R = v->R;
+    out->ple_gated = v->ple_gated;
+    out->ple_normed = v->ple_normed;
+    out->qkv = v->qkv;
+    out->ga = v->ga;
+    out->gb = v->gb;
+    out->lin_o = v->lin_o;
+    out->qg = v->qg;
+    out->kp = v->kp;
+    out->vp = v->vp;
+    out->iq = v->iq;
+    out->ik = v->ik;
+    out->q = v->q;
+    out->gate = v->gate;
+    out->iqn = v->iqn;
+    out->attn_o = v->attn_o;
+}
+
+static bool qwen4_batch_logits_ensure(ds4_qwen4_gpu_graph *g, uint32_t rows) {
+    if (g->batch_logits && g->batch_logit_rows >= rows) return true;
+    ds4_gpu_tensor_free(g->batch_logits);
+    g->batch_logit_rows = 0;
+    g->batch_logits = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_VOCAB * sizeof(float));
+    if (!g->batch_logits) return false;
+    g->batch_logit_rows = rows;
+    return true;
+}
+
+/* Token embeddings, rope positions and n-gram rows for every member.  The
+ * n-gram gather is the part that most wants a batch: one call presents all
+ * rows at once, so the reader sorts them by offset and issues them in
+ * parallel instead of walking each session's sixteen rows on its own. */
+static bool qwen4_batch_stage_embeddings(ds4_decode_item *items, int count,
+                                         const ds4_model *m, const ds4_weights *w,
+                                         ds4_qwen4_gpu_graph *g,
+                                         uint32_t *ids) {
+    const uint32_t E = DS4_N_EMBD, hc = DS4_N_HC, hc_dim = E * hc;
+    float *row = g->host_row;
+    for (int i = 0; i < count; i++) {
+        ds4_qwen4_gpu_graph *rg = &items[i].session->qwen4_graph;
+        float *dst = row + (uint64_t)i * hc_dim;
+        qwen4_ref_row(m, w->token_embd, (uint64_t)items[i].token, dst);
+        for (uint32_t s = 1; s < hc; s++) memcpy(dst + (uint64_t)s * E, dst, E * sizeof(float));
+        uint32_t pos3[4];
+        qwen4_mrope_pos(NULL, 0, rg->pos, &rg->mrope_delta, pos3);
+        pos3[3] = 0;
+        if (!ds4_gpu_tensor_write(rg->pos3, (uint64_t)rg->pos * 16u, pos3, 16u)) return false;
+        qwen4_ple_step(items[i].token, rg->ple_prev, ids + (uint64_t)i * DS4_N_PLE_HEADS);
+    }
+    return ds4_gpu_tensor_write(g->R, 0, row, (uint64_t)count * hc_dim * sizeof(float)) != 0;
+}
+
+/* The n-gram rows are hashed across a 95 GiB table, so this is disk latency
+ * rather than compute, and the first trunk layer does not need them: the PLE
+ * layer that does sits at trunk index one.  Reading them after that layer has
+ * been submitted lets the wait overlap GPU work instead of preceding it. */
+static bool qwen4_batch_stage_ngrams(ds4_decode_item *items, int count,
+                                     const ds4_model *m, ds4_qwen4_gpu_graph *g,
+                                     const uint32_t *ids) {
+    (void)items;
+    float *row = g->host_row;
+    if (!qwen4_ngram_read(m, ids, (size_t)count * DS4_N_PLE_HEADS, row)) {
+        fprintf(stderr, "ds4: n-gram read failed: %s\n", strerror(errno));
+        return false;
+    }
+    return ds4_gpu_tensor_write(g->ple_emb, 0, row,
+                                (uint64_t)count * DS4_N_EMBD * sizeof(float)) != 0;
+}
+
+/* The batched scan needs every row's state in the pool it addresses. */
+static bool qwen4_batch_rows_pooled(ds4_decode_item *items, int count, uint32_t *slots) {
+    for (int i = 0; i < count; i++) {
+        const int slot = items[i].session->qwen4_slot;
+        if (slot < 0) return false;
+        slots[i] = (uint32_t)slot;
+    }
+    return true;
+}
+
+static bool qwen4_batch_linear(ds4_decode_item *items, int count,
+                               const qwen4_batch_row *views,
+                               const ds4_qwen4_gpu_graph *rowg,
+                               ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                               const ds4_layer_weights *l, uint32_t il, uint32_t T) {
+    if (!qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) ||
+        !qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T) ||
+        !qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) ||
+        !qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T)) {
+        return false;
+    }
+    /* The causal convolution and the delta-net scan are the only steps that
+     * read and write a session's own recurrent state.  Overlapping these rows
+     * through a concurrent encoder was measured and changed nothing: the cost
+     * is the per-dispatch floor, not a barrier between them. */
+    ds4_engine *e = items[0].session->engine;
+    uint32_t slots[QWEN4_BATCH_MAX_ROWS];
+    const bool pooled = e->qwen4_lin_state_pool[il] &&
+        getenv("DS4_QWEN4_NO_BATCH_SCAN") == NULL &&
+        qwen4_batch_rows_pooled(items, count, slots);
+    const uint64_t hist_floats = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM;
+    if (pooled) {
+        if (ds4_gpu_qwen4_conv_stream_rows_tensor(
+                g->qkv, e->qwen4_lin_hist_pool[il], m->map, m->size, l->lin_conv->abs_offset,
+                slots, (uint32_t)count, DS4_N_LIN_CONV_DIM, DS4_N_LIN_CONV,
+                (uint32_t)hist_floats, DS4_N_LIN_CONV_DIM, 1) == 0) {
+            return false;
+        }
+    } else {
+        for (int i = 0; i < count; i++) {
+            if (!ds4_gpu_qwen4_conv_stream_tensor(views[i].qkv, rowg[i].layer_lin_hist[il],
+                                                  m->map, m->size, l->lin_conv->abs_offset,
+                                                  1u, DS4_N_LIN_CONV_DIM, DS4_N_LIN_CONV, true)) {
+                return false;
+            }
+        }
+    }
+    if (!ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size,
+                                       l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                       T, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                       DS4_N_LIN_HEAD_DIM)) {
+        return false;
+    }
+    /* With every row's state in the pool, one dispatch advances them all; the
+     * per-row kernels are short enough that sixteen of them never reach steady
+     * state.  Same grouping and arithmetic per row, so the two paths agree bit
+     * for bit.  DS4_QWEN4_NO_BATCH_SCAN takes the per-row path for A/B. */
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    if (pooled) {
+        if (ds4_gpu_qwen4_gdn_scan_rows_tensor(
+                g->lin_o, e->qwen4_lin_state_pool[il], g->qkv, g->ga, g->gb,
+                slots, (uint32_t)count, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                DS4_N_LIN_HEAD_DIM, (uint32_t)(v_dim * DS4_N_LIN_HEAD_DIM),
+                DS4_N_LIN_CONV_DIM, (uint32_t)v_dim) == 0) {
+            return false;
+        }
+    } else {
+        for (int i = 0; i < count; i++) {
+            if (ds4_gpu_qwen4_gdn_scan_tensor(views[i].lin_o, rowg[i].layer_lin_state[il],
+                                              views[i].qkv, views[i].ga, views[i].gb, 1u,
+                                              DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                              DS4_N_LIN_HEAD_DIM, NULL, 0u, NULL, 1u) == 0) {
+                return false;
+            }
+        }
+    }
+    return ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size,
+                                        l->lin_norm->abs_offset, T, DS4_N_LIN_V_HEAD,
+                                        DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
+           qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
+}
+
+static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
+                                  ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il, uint32_t T) {
+    const uint32_t ratio = 4u;
+    bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T) &&
+              qwen4_gemv(g->kp, m, l->attn_k, g->mixed, T) &&
+              qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
+              qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
+              qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+    /* Each row appends to its own KV and indexer caches at its own position,
+     * then reads them back through its own block selection. */
+    for (int i = 0; ok && i < count; i++) {
+        ds4_qwen4_gpu_graph *r = &rowg[i];
+        const uint32_t pos0 = r->pos;
+        ok = ds4_gpu_qwen4_attn_prep_tensor(r->q, r->gate, r->layer_k_cache[il],
+                                            r->layer_v_cache[il], r->iqn, r->layer_ik_cache[il],
+                                            r->qg, r->kp, r->vp, r->iq, r->ik, r->pos3,
+                                            m->map, m->size, l->attn_q_norm->abs_offset,
+                                            l->attn_k_norm->abs_offset,
+                                            l->indexer_q_norm->abs_offset, 1u, DS4_N_HEAD,
+                                            DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
+                                            DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM,
+                                            pos0, r->ctx_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+        const uint32_t first_block = pos0 / ratio;
+        const uint32_t n_blocks_after = (pos0 + 1u) / ratio;
+        if (ok && n_blocks_after > first_block) {
+            ok = ds4_gpu_qwen4_idx_block_key_tensor(r->layer_block_key[il], r->layer_ik_cache[il],
+                                                    r->pos3, m->map, m->size,
+                                                    l->indexer_k_norm->abs_offset, first_block,
+                                                    n_blocks_after - first_block, ratio,
+                                                    DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                                                    DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+        }
+        if (ok) ok = qwen4_graph_attention_core(r, il, r->q, r->gate, r->iqn, r->attn_o,
+                                                n_blocks_after, pos0, 1u);
+    }
+    return ok && qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+}
+
+static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int count,
+                                                    ds4_qwen4_gpu_graph *g,
+                                                    const ds4_model *m, const ds4_weights *w) {
+    const uint32_t T = (uint32_t)count;
+    const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
+    const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+
+    qwen4_batch_row *views = xmalloc((size_t)count * sizeof(*views));
+    ds4_qwen4_gpu_graph *rowg = xmalloc((size_t)count * sizeof(*rowg));
+    bool ok = qwen4_batch_rows_build(views, count, g);
+    for (int i = 0; ok && i < count; i++) {
+        qwen4_batch_row_graph(&rowg[i], items[i].session, &views[i]);
+    }
+    if (ok) ok = qwen4_batch_logits_ensure(g, T);
+
+    /* DS4_QWEN4_BATCH_TIMING=1 synchronizes after each stage group and reports
+     * GPU ms per group.  The synchronization is itself expensive, so the split
+     * is for attribution only, never for a throughput claim. */
+    static int timing = -1;
+    if (timing < 0) timing = getenv("DS4_QWEN4_BATCH_TIMING") != NULL;
+    double prof[7] = {0};
+    double prof_last = 0.0;
+#define QWEN4_BATCH_PROF(idx_) do { \
+        if (timing) { \
+            ds4_gpu_end_commands(); \
+            const double now_ = now_sec(); \
+            prof[idx_] += now_ - prof_last; \
+            prof_last = now_; \
+            glm_graph_begin_commands_if_needed(); \
+        } \
+    } while (0)
+
+    uint32_t ple_ids[QWEN4_BATCH_MAX_ROWS * DS4_MAX_PLE_HEADS];
+    bool ngrams_staged = false;
+    if (timing) prof_last = now_sec();
+    if (ok) ok = qwen4_batch_stage_embeddings(items, count, m, w, g, ple_ids);
+    QWEN4_BATCH_PROF(0);
+
+    for (uint32_t il = 0; ok && il < n_trunk; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!ngrams_staged && ds4_qwen4_layer_is_ple(il)) {
+            /* Submit everything encoded so far, then read the n-gram rows
+             * while the GPU works through it.  DS4_QWEN4_NO_NGRAM_OVERLAP
+             * reads them up front instead, which is the same work with the
+             * GPU idle for it. */
+            ngrams_staged = true;
+            ok = (getenv("DS4_QWEN4_NO_NGRAM_OVERLAP") != NULL ||
+                  ds4_gpu_flush_commands() != 0) &&
+                 qwen4_batch_stage_ngrams(items, count, m, g, ple_ids);
+            if (!ok) break;
+        }
+        if (ds4_qwen4_layer_is_ple(il)) {
+            ok = qwen4_gemv(g->ple_key, m, l->ple_key, g->ple_emb, T) &&
+                 qwen4_gemv(g->ple_val, m, l->ple_value, g->ple_emb, T) &&
+                 ds4_gpu_qwen4_ple_gate_tensor(g->ple_gated, g->ple_normed, g->R, g->ple_key,
+                                               g->ple_val, m->map, m->size,
+                                               l->ple_norm_key->abs_offset,
+                                               l->ple_norm_query->abs_offset,
+                                               l->ple_norm_conv->abs_offset,
+                                               T, DS4_N_EMBD, DS4_N_HC, DS4_RMS_EPS);
+            /* the n-gram convolution carries per-session history */
+            for (int i = 0; ok && i < count; i++) {
+                ok = ds4_gpu_qwen4_ple_conv_tensor(views[i].R, views[i].ple_gated,
+                                                   views[i].ple_normed,
+                                                   rowg[i].ple_hist, m->map, m->size,
+                                                   l->ple_conv->abs_offset, l->ple_conv->type,
+                                                   1u, hc_dim, DS4_N_PLE_CONV, DS4_N_PLE_NGRAM,
+                                                   NULL, 0u, NULL, 1u);
+            }
+        }
+        QWEN4_BATCH_PROF(1);
+        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down,
+                                        l->hc_attn_up, l->hc_attn_inject, T);
+        QWEN4_BATCH_PROF(2);
+        if (ok) {
+            ok = ds4_qwen4_layer_is_linear(il)
+                ? qwen4_batch_linear(items, count, views, rowg, g, m, l, il, T)
+                : qwen4_batch_attention(count, rowg, g, m, l, il, T);
+        }
+        QWEN4_BATCH_PROF(ds4_qwen4_layer_is_linear(il) ? 3 : 4);
+        if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T,
+                                                     DS4_N_EMBD, DS4_N_HC) != 0;
+        if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down,
+                                        l->hc_ffn_up, l->hc_ffn_inject, T);
+        QWEN4_BATCH_PROF(5);
+        if (ok) ok = qwen4_graph_moe(g, m, l, T);
+        QWEN4_BATCH_PROF(6);
+    }
+    /* The output matrix is the single largest weight read of a decode step,
+     * so it serves every row in one pass. */
+    if (ok) ok = qwen4_graph_hc_mix(g, m, w->output_hc_norm, w->output_hc_down,
+                                    w->output_hc_up, NULL, T) &&
+                 qwen4_gemv(g->batch_logits, m, w->output, g->mixed, T);
+
+    if (timing) {
+        fprintf(stderr, "ds4: Qwen3.8 batch(T=%u) ms: stage %.1f ple %.1f hc_attn %.1f "
+                "gdn %.1f attn %.1f hc_ffn %.1f moe %.1f\n", T,
+                1e3 * prof[0], 1e3 * prof[1], 1e3 * prof[2], 1e3 * prof[3],
+                1e3 * prof[4], 1e3 * prof[5], 1e3 * prof[6]);
+    }
+#undef QWEN4_BATCH_PROF
+    qwen4_batch_rows_free(views, count);
+    free(views);
+    free(rowg);
+    return ok;
+}
+/* Every member must already share the engine arena, because the single-row
+ * kernels address it through that session's own graph.  Sessions carrying
+ * images, steering, MTP state or a pending verify snapshot keep the ordered
+ * fallback: those all add per-session work the batch does not encode. */
+static bool qwen4_graph_native_session_batch_supported(ds4_decode_item *items, int count,
+                                                       const ds4_engine *e) {
+    const char *env = getenv("DS4_QWEN4_SESSION_BATCH");
+    if ((env && env[0] && strcmp(env, "0") == 0) ||
+        count < 2 || count > QWEN4_BATCH_MAX_ROWS ||
+        !e->qwen4_shared_workspace || e->glm_mtp) {
+        return false;
+    }
+    const ds4_qwen4_gpu_graph *arena = e->qwen4_shared_workspace;
+    if (arena->cap_tokens < (uint32_t)count) return false;
+    for (int i = 0; i < count; i++) {
+        const ds4_session *s = items[i].session;
+        const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        if (!s || s->engine != e || s->distributed || !s->checkpoint_valid ||
+            !s->qwen4_graph_ready || ds4_session_is_cpu(s) ||
+            g->owns_scratch || g->R != arena->R ||
+            g->n_block_cap > arena->n_block_cap ||
+            g->pos != (uint32_t)s->checkpoint.len ||
+            g->vis_span_count != 0 || g->mtp_R ||
+            g->snap_after_first || g->snap_after_second ||
+            g->steer_attn_scale != 0.0f || g->steer_ffn_scale != 0.0f ||
+            g->dump_prompt_rows) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#endif /* DS4_HAS_QWEN4_METAL */
+
 static bool ds4_sessions_eval_batch_metal_supported(
         ds4_decode_item *items,
         int count,
@@ -77854,11 +78514,14 @@ static bool ds4_sessions_eval_batch_metal_supported(
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
         return ds41_sessions_batch_supported(items, count, e);
 #endif
+#ifdef DS4_HAS_QWEN4_METAL
+    if (items[0].session && ds4_session_is_qwen4(items[0].session))
+        return qwen4_graph_native_session_batch_supported(items, count, e);
+#endif
     for (int i = 0; i < count; i++) {
         ds4_session *s = items[i].session;
         if (!s || s->engine != e || s->distributed ||
-            ds4_session_is_cpu(s) || !s->checkpoint_valid ||
-            ds4_session_is_qwen4(s)) {   /* Qwen3.8 graphs decode per session */
+            ds4_session_is_cpu(s) || !s->checkpoint_valid) {
             return false;
         }
         if (ds4_session_is_glm(s)) {
@@ -78264,12 +78927,23 @@ static int ds4_sessions_eval_batch_native(
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(1);
 #endif
+    /* DS4_BATCH_PHASES=1 splits a batched step (any model) into the host's
+     * encode and the wait for the GPU, taking no synchronization of its own:
+     * it is the only way to tell whether shaving dispatches buys host time or
+     * GPU time, which decides whether batching more of them is worth it. */
+    static int phases = -1;
+    if (phases < 0) phases = getenv("DS4_BATCH_PHASES") != NULL;
+    const double t_batch_begin = phases ? now_sec() : 0.0;
     bool ok = ds4_gpu_begin_commands() != 0;
     const bool native_ds41 = ds4_session_is_ds41(items[0].session);
     const uint32_t prefill_rows = prefill ?
         (uint32_t)(prefill_prompt->len - prefill->checkpoint.len) : 0u;
     const bool native_glm53 = ok &&
         glm53_graph_native_session_batch_supported(items, count);
+#ifdef DS4_HAS_QWEN4_METAL
+    const bool native_qwen4 = ok && !prefill &&
+        ds4_session_is_qwen4(items[0].session);
+#endif
     const bool native_shared = ok && !native_ds41 && !native_glm53 &&
         metal_graph_native_session_batch_shared_supported(items, count, e);
     const bool native_qkv = native_shared &&
@@ -78290,6 +78964,11 @@ static int ds4_sessions_eval_batch_native(
                                           prefill_rows, &e->model, &e->weights);
 #else
         ok = false;
+#endif
+#ifdef DS4_HAS_QWEN4_METAL
+    } else if (native_qwen4) {
+        ok = qwen4_graph_encode_native_session_batch(
+                items, count, e->qwen4_shared_workspace, &e->model, &e->weights);
 #endif
     } else if (native_glm53) {
         ok = glm53_graph_encode_native_session_batch(
@@ -78322,7 +79001,19 @@ static int ds4_sessions_eval_batch_native(
             }
         }
     }
+    const double t_encoded = phases ? now_sec() : 0.0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (phases) {
+        static double acc_encode, acc_gpu;
+        static unsigned n_calls;
+        acc_encode += t_encoded - t_batch_begin;
+        acc_gpu += now_sec() - t_encoded;
+        if (++n_calls % 16u == 0u) {
+            fprintf(stderr, "ds4: batch phases avg ms: encode %.2f gpu_wait %.2f\n",
+                    1e3 * acc_encode / 16.0, 1e3 * acc_gpu / 16.0);
+            acc_encode = acc_gpu = 0.0;
+        }
+    }
     else (void)ds4_gpu_synchronize();
 #if defined(__APPLE__)
     if (e->tp.active) ds4_gpu_tp_set_session_batch_mode(0);
@@ -78341,6 +79032,16 @@ static int ds4_sessions_eval_batch_native(
 #endif
     for (int i = 0; ok && i < count; i++) {
         ds4_session *s = items[i].session;
+#ifdef DS4_HAS_QWEN4_METAL
+        if (native_qwen4) {
+            ok = ds4_gpu_tensor_read(e->qwen4_shared_workspace->batch_logits,
+                                     (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                     s->logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+            if (ok) s->qwen4_graph.pos++;
+            continue;
+        }
+#endif
         ds4_gpu_tensor *logits = ds4_session_is_glm(s)
             ? s->glm_graph.logits : metal_graph_logits(&s->graph);
 #ifdef DS4_HAS_DEEPSEEK41_GPU

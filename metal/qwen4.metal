@@ -499,6 +499,53 @@ kernel void kernel_qwen4_conv_stream(
     for (uint t = 0; t + 1 < K; t++) state[t * C + c] = win[t];
 }
 
+struct ds4_metal_args_qwen4_conv_stream_rows {
+    uint32_t n_rows;
+    uint32_t n_channels;
+    uint32_t conv_kernel;
+    uint32_t apply_silu;
+    uint32_t state_stride;   /* floats between two slots of the history pool */
+    uint32_t x_stride;       /* floats between two rows of the batch arena */
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+/* One decode token for every row of a batch, each against its own slot of the
+ * convolution history.  Identical arithmetic to kernel_qwen4_conv_stream with
+ * n_tokens = 1, so the two agree bit for bit; the rows merely share a
+ * dispatch instead of taking one each. */
+kernel void kernel_qwen4_conv_stream_rows(
+        constant ds4_metal_args_qwen4_conv_stream_rows & args,
+        device float       *x,
+        device float       *state,
+        device const float *weight,
+        device const uint  *slots,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint c = tgpig.x * ntg.x + tid;
+    const uint row = tgpig.y;
+    if (c >= args.n_channels || row >= args.n_rows) return;
+    const uint C = args.n_channels;
+    const uint K = args.conv_kernel;
+
+    device float *st = state + (uint64_t)slots[row] * args.state_stride;
+    device float *xr = x + (uint64_t)row * args.x_stride;
+
+    float win[3];
+    for (uint t = 0; t + 1 < K; t++) win[t] = st[t * C + c];
+    float taps[4];
+    for (uint t = 0; t < K; t++) taps[t] = weight[c * K + t];
+
+    const float raw = xr[c];
+    float acc = taps[K - 1] * raw;
+    for (uint t = 0; t + 1 < K; t++) acc += taps[t] * win[t];
+    for (uint t = 0; t + 2 < K; t++) win[t] = win[t + 1];
+    win[K - 2] = raw;
+    xr[c] = args.apply_silu ? qwen4_silu(acc) : acc;
+    for (uint t = 0; t + 1 < K; t++) st[t * C + c] = win[t];
+}
+
 #define QWEN4_CONV_BLOCK 64u
 /* Only incoming block windows need a snapshot; raw rows inside each block
  * stay private to its channel thread until they have entered the window. */
@@ -663,6 +710,65 @@ kernel void kernel_qwen4_gdn_scan(
 /* Scan for head_dim 128: one simdgroup per (v-head, 4 consecutive dv
  * rows), so k/q/g/beta are loaded once per four state rows and the eight
  * reductions per token overlap.  Same math and state layout as above. */
+struct ds4_metal_args_qwen4_gdn_scan_rows {
+    uint32_t n_rows;
+    uint32_t n_k_head;
+    uint32_t n_v_head;
+    uint32_t head_dim;
+    uint32_t state_stride;   /* floats between two slots of the pool */
+    uint32_t qkv_stride;     /* floats between two rows of the batch arena */
+    uint32_t out_stride;
+    uint32_t pad0;
+};
+
+/* One decode step for every row of a batch, each against its own slot of the
+ * recurrent state pool.  Same arithmetic as kernel_qwen4_gdn_scan_r4 with
+ * n_tokens = 1, so the result is bit-identical to running that kernel once per
+ * row; what changes is that the rows share one dispatch, which is long enough
+ * to reach steady state where sixteen short ones were not.  head_dim is 128,
+ * as in kernel_qwen4_gdn_scan_r4. */
+kernel void kernel_qwen4_gdn_scan_rows(
+        constant ds4_metal_args_qwen4_gdn_scan_rows & args,
+        device const float *qkv,
+        device const float *ga,
+        device const float *gb,
+        device float       *state,
+        device float       *out,
+        device const uint  *slots,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint dv0 = (tgpig.x * (ntg.x / 32) + sgitg) * 4;
+    const uint h = tgpig.y;
+    const uint row = tgpig.z;
+    if (dv0 >= args.head_dim || h >= args.n_v_head || row >= args.n_rows) return;
+    const uint D = 128, dk0 = tiisg * 4;
+    const uint kh = h % args.n_k_head;
+
+    device float *srow = state + (uint64_t)slots[row] * args.state_stride +
+                         ((uint64_t)h * D + dv0) * D + dk0;
+    device const float *base = qkv + (uint64_t)row * args.qkv_stride;
+    const float4 q = *(device const float4 *)(base + kh * D + dk0);
+    const float4 k = *(device const float4 *)(base + (args.n_k_head + kh) * D + dk0);
+    const float4 v = *(device const float4 *)(base + 2 * args.n_k_head * D + h * D + dv0);
+    const float g = ga[(uint64_t)row * args.n_v_head + h];
+    const float beta = gb[(uint64_t)row * args.n_v_head + h];
+
+    float4 s[4];
+    for (uint r = 0; r < 4; r++) s[r] = *(device const float4 *)(srow + r * D);
+    float u[4], o[4];
+    for (uint r = 0; r < 4; r++) { s[r] *= g; u[r] = dot(s[r], k); }
+    for (uint r = 0; r < 4; r++) u[r] = simd_sum(u[r]);
+    for (uint r = 0; r < 4; r++) { s[r] += k * ((v[r] - u[r]) * beta); o[r] = dot(s[r], q); }
+    for (uint r = 0; r < 4; r++) o[r] = simd_sum(o[r]);
+    if (tiisg == 0) {
+        *(device float4 *)(out + (uint64_t)row * args.out_stride + (uint64_t)h * D + dv0) =
+            float4(o[0], o[1], o[2], o[3]);
+    }
+    for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
+}
+
 kernel void kernel_qwen4_gdn_scan_r4(
         constant ds4_metal_args_qwen4_gdn_scan & args,
         device const float *qkv,
@@ -3446,7 +3552,10 @@ struct ds4_metal_args_qwen4_dense_mm {
     uint32_t out_rows;
     uint32_t weight_type;   /* 0 f32, 1 f16, 8 q8_0 */
     uint32_t row_bytes;
-    uint32_t pad0;
+    /* Number of k-splits.  One (or zero) writes straight to out; more makes
+     * each grid slice cover a slice of k and write its own partial plane,
+     * which kernel_qwen4_dense_mm_reduce then sums. */
+    uint32_t n_split;
     uint32_t pad1;
     uint32_t pad2;
 };
@@ -3487,7 +3596,13 @@ kernel void kernel_qwen4_dense_mm(
     simdgroup_float8x8 C[4];
     for (uint j = 0; j < 4; j++) C[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     const uint nk = (args.in_dim + QWEN4_DM_K - 1) / QWEN4_DM_K;
-    for (uint kb = 0; kb < nk; kb++) {
+    /* A narrow projection gives this kernel only a handful of threadgroups,
+     * each walking every k-block in turn; splitting k spreads that walk over
+     * the machine instead. */
+    const uint nsplit = args.n_split ? args.n_split : 1u;
+    const uint kb_lo = (uint)(((uint64_t)tgpig.z * nk) / nsplit);
+    const uint kb_hi = (uint)(((uint64_t)(tgpig.z + 1u) * nk) / nsplit);
+    for (uint kb = kb_lo; kb < kb_hi; kb++) {
         {
             const uint r = tid / 4, q = tid % 4;
             if (row0 + r < args.out_rows) {
@@ -3525,8 +3640,25 @@ kernel void kernel_qwen4_dense_mm(
         const uint sg = idx / 256, rem = idx % 256, j = rem / 64, el = rem % 64, r = el / 8, tok = el % 8;
         const uint row = row0 + sg * 8 + r;
         const uint t = t0 + j * 8 + tok;
-        if (row < args.out_rows && t < args.n_tokens) out[(uint64_t)t * args.out_rows + row] = Cs[sg][j][el];
+        if (row < args.out_rows && t < args.n_tokens) {
+            out[(uint64_t)tgpig.z * args.n_tokens * args.out_rows +
+                (uint64_t)t * args.out_rows + row] = Cs[sg][j][el];
+        }
     }
+}
+
+/* Sum the k-split planes written above. */
+kernel void kernel_qwen4_dense_mm_reduce(
+        constant ds4_metal_args_qwen4_dense_mm & args,
+        device const float *partials,
+        device float       *out,
+        uint gid [[thread_position_in_grid]]) {
+    const uint n = args.n_tokens * args.out_rows;
+    if (gid >= n) return;
+    const uint nsplit = args.n_split ? args.n_split : 1u;
+    float acc = 0.0f;
+    for (uint s = 0; s < nsplit; s++) acc += partials[(uint64_t)s * n + gid];
+    out[gid] = acc;
 }
 
 struct ds4_metal_args_qwen4_hc_mix_rows {

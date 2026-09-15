@@ -15237,11 +15237,17 @@ static void log_context_memory(ds4_backend backend, int ctx_size,
                m.raw_cap,
                m.comp_cap);
     if (session_count > 1) {
+        /* Only the caches repeat per slot.  Where the model shares one prefill
+         * workspace across slots, the transients are paid once instead. */
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        const double caches = (double)(m.raw_bytes + m.compressed_bytes);
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: %d resident sessions request at least %.2f GiB of context buffers",
+                   "ds4-server: %d resident sessions request at least %.2f GiB of "
+                   "context buffers, or %.2f GiB when the model shares one prefill "
+                   "workspace",
                    session_count,
-                   (double)m.total_bytes * (double)session_count /
-                       (1024.0 * 1024.0 * 1024.0));
+                   (double)m.total_bytes * (double)session_count / gib,
+                   (caches * (double)session_count + (double)m.scratch_bytes) / gib);
     }
 }
 static void server_close_resources(server *s) {
