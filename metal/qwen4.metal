@@ -2890,6 +2890,94 @@ QWEN4_MOE_MID_Q4K_INSTANCE(1, "kernel_qwen4_moe_mid_q4k_nr1")
  * accumulators and block walk, so its outputs are kernel_qwen4_moe_mid_q4k's
  * bit for bit; the other pairs of the list return at once.  No shared slot:
  * the batch runs the shared expert as dense projections. */
+/* One pass of the grouped mid kernel over NJ pairs of one expert: the
+ * block's scales and the lane's eight nibbles come in as words (the byte
+ * values are the same), the sub-scale decode and the dequantized weights
+ * are computed once per block and row, and every pair accumulates in its
+ * own named registers in the per-token kernel's order. */
+template <uint NR, uint NJ>
+static inline void qwen4_moe_mid_q4k_pass(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base, device const char *up_base,
+        device const float *x, device float *mid, device const int32_t *list,
+        uint64_t ebase, uint row0, uint nb, uint group, uint l, uint shift, ushort tiisg) {
+    device const float *xs[NJ];
+    uint pairs[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        pairs[j] = (uint)list[j];
+        xs[j] = x + (uint64_t)(pairs[j] / args.n_slots) * args.in_dim;
+    }
+    float sg_[NJ][NR], su_[NJ][NR];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+#pragma unroll
+        for (uint r = 0; r < NR; r++) { sg_[j][r] = 0.0f; su_[j][r] = 0.0f; }
+    }
+    for (uint ib = 0; ib < nb; ib++) {
+        const uint yo = ib * 256 + group * 32 + l;
+        float y[NJ][8];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            const float4 ya = *(device const float4 *)(xs[j] + yo);
+            const float4 yb = *(device const float4 *)(xs[j] + yo + 4);
+            y[j][0] = ya.x; y[j][1] = ya.y; y[j][2] = ya.z; y[j][3] = ya.w;
+            y[j][4] = yb.x; y[j][5] = yb.y; y[j][6] = yb.z; y[j][7] = yb.w;
+        }
+#pragma unroll
+        for (uint r = 0; r < NR; r++) {
+            if (row0 + r >= args.out_rows) break;
+            const uint64_t off = ebase + (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
+            device const uchar *bg = (device const uchar *)(gate_base + off);
+            device const uchar *bu = (device const uchar *)(up_base + off);
+            const uint dg2 = *(device const uint *)bg, du2 = *(device const uint *)bu;
+            const uint3 scg = *(device const uint3 *)(bg + 4), scu = *(device const uint3 *)(bu + 4);
+            const uint2 qg2 = *(device const uint2 *)(bg + 16 + (group >> 1) * 32 + l);
+            const uint2 qu2 = *(device const uint2 *)(bu + 16 + (group >> 1) * 32 + l);
+            const float dg = (float)as_type<half>((ushort)(dg2 & 0xFFFFu));
+            const float dmg = (float)as_type<half>((ushort)(dg2 >> 16));
+            const float du = (float)as_type<half>((ushort)(du2 & 0xFFFFu));
+            const float dmu = (float)as_type<half>((ushort)(du2 >> 16));
+#define QWEN4_Q4K_SCB(W_, I_) ((((I_) < 4u ? (W_).x : (I_) < 8u ? (W_).y : (W_).z) >> (8u * ((I_) & 3u))) & 0xFFu)
+            uint sg, mg, su, mu;
+            if (group < 4) {
+                sg = QWEN4_Q4K_SCB(scg, group) & 63u; mg = QWEN4_Q4K_SCB(scg, group + 4) & 63u;
+                su = QWEN4_Q4K_SCB(scu, group) & 63u; mu = QWEN4_Q4K_SCB(scu, group + 4) & 63u;
+            } else {
+                sg = (QWEN4_Q4K_SCB(scg, group + 4) & 0xFu) | ((QWEN4_Q4K_SCB(scg, group - 4) & 0xC0u) >> 2);
+                mg = (QWEN4_Q4K_SCB(scg, group + 4) >> 4) | ((QWEN4_Q4K_SCB(scg, group) & 0xC0u) >> 2);
+                su = (QWEN4_Q4K_SCB(scu, group + 4) & 0xFu) | ((QWEN4_Q4K_SCB(scu, group - 4) & 0xC0u) >> 2);
+                mu = (QWEN4_Q4K_SCB(scu, group + 4) >> 4) | ((QWEN4_Q4K_SCB(scu, group) & 0xC0u) >> 2);
+            }
+#undef QWEN4_Q4K_SCB
+            const float dsg = dg * (float)sg, dmin_g = dmg * (float)mg;
+            const float dsu = du * (float)su, dmin_u = dmu * (float)mu;
+#pragma unroll
+            for (uint i = 0; i < 8; i++) {
+                const uint qgi = ((i < 4u ? qg2.x : qg2.y) >> (8u * (i & 3u))) & 0xFFu;
+                const uint qui = ((i < 4u ? qu2.x : qu2.y) >> (8u * (i & 3u))) & 0xFFu;
+                const float wg = dsg * (float)((qgi >> shift) & 0xFu) - dmin_g;
+                const float wu = dsu * (float)((qui >> shift) & 0xFu) - dmin_u;
+#pragma unroll
+                for (uint j = 0; j < NJ; j++) {
+                    sg_[j][r] += wg * y[j][i];
+                    su_[j][r] += wu * y[j][i];
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < NR; r++) {
+        if (row0 + r >= args.out_rows) break;
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            const float g = simd_sum(sg_[j][r]);
+            const float u = simd_sum(su_[j][r]);
+            if (tiisg == 0) mid[(uint64_t)pairs[j] * args.out_rows + row0 + r] = qwen4_silu(g) * u;
+        }
+    }
+}
+
 template <uint NR>
 kernel void kernel_qwen4_moe_mid_q4k_grouped(
         constant ds4_metal_args_qwen4_moe & args,
@@ -2922,76 +3010,16 @@ kernel void kernel_qwen4_moe_mid_q4k_grouped(
     const uint nb = args.in_dim / 256;
     const uint group = tiisg / 4, l = (tiisg % 4) * 8;
     const uint shift = (group & 1u) * 4u;
-    /* Up to four pairs per pass, each with its own named accumulators: an
-     * array indexed by the pair would leave the registers. */
+    /* Up to four pairs per pass, the count a template constant so the inner
+     * loops carry no per-pair branch; each pair keeps named accumulators (an
+     * array indexed by the pair would leave the registers). */
     for (uint j0 = 0; j0 < count; j0 += 4u) {
         const uint nj = min(4u, count - j0);
-        const uint p0 = (uint)list[j0], p1 = (uint)list[j0 + min(1u, nj - 1u)];
-        const uint p2 = (uint)list[j0 + min(2u, nj - 1u)], p3 = (uint)list[j0 + min(3u, nj - 1u)];
-        device const float *x0 = x + (uint64_t)(p0 / args.n_slots) * args.in_dim;
-        device const float *x1 = x + (uint64_t)(p1 / args.n_slots) * args.in_dim;
-        device const float *x2 = x + (uint64_t)(p2 / args.n_slots) * args.in_dim;
-        device const float *x3 = x + (uint64_t)(p3 / args.n_slots) * args.in_dim;
-        float g0[NR], u0[NR], g1[NR], u1[NR], g2[NR], u2[NR], g3[NR], u3[NR];
-        for (uint r = 0; r < NR; r++) {
-            g0[r] = u0[r] = g1[r] = u1[r] = g2[r] = u2[r] = g3[r] = u3[r] = 0.0f;
-        }
-        for (uint ib = 0; ib < nb; ib++) {
-            const uint yo = ib * 256 + group * 32 + l;
-            float y0[8], y1[8], y2[8], y3[8];
-            for (uint i = 0; i < 8; i++) y0[i] = x0[yo + i];
-            if (nj > 1u) for (uint i = 0; i < 8; i++) y1[i] = x1[yo + i];
-            if (nj > 2u) for (uint i = 0; i < 8; i++) y2[i] = x2[yo + i];
-            if (nj > 3u) for (uint i = 0; i < 8; i++) y3[i] = x3[yo + i];
-            for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
-                const uint64_t off = ebase + (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
-                device const uchar *bg = (device const uchar *)(gate_base + off);
-                device const uchar *bu = (device const uchar *)(up_base + off);
-                const float dg = (float)(*(device const half *)bg);
-                const float dmg = (float)(*(device const half *)(bg + 2));
-                const float du = (float)(*(device const half *)bu);
-                const float dmu = (float)(*(device const half *)(bu + 2));
-                device const uchar *scg = bg + 4;
-                device const uchar *scu = bu + 4;
-                uint sg, mg, su, mu;
-                if (group < 4) {
-                    sg = scg[group] & 63u; mg = scg[group + 4] & 63u;
-                    su = scu[group] & 63u; mu = scu[group + 4] & 63u;
-                } else {
-                    sg = (scg[group + 4] & 0xFu) | ((scg[group - 4] & 0xC0u) >> 2);
-                    mg = (scg[group + 4] >> 4) | ((scg[group] & 0xC0u) >> 2);
-                    su = (scu[group + 4] & 0xFu) | ((scu[group - 4] & 0xC0u) >> 2);
-                    mu = (scu[group + 4] >> 4) | ((scu[group] & 0xC0u) >> 2);
-                }
-                const float dsg = dg * (float)sg, dmin_g = dmg * (float)mg;
-                const float dsu = du * (float)su, dmin_u = dmu * (float)mu;
-                device const uchar *qg = bg + 16 + (group >> 1) * 32 + l;
-                device const uchar *qu = bu + 16 + (group >> 1) * 32 + l;
-                for (uint i = 0; i < 8; i++) {
-                    const float wg = dsg * (float)((qg[i] >> shift) & 0xFu) - dmin_g;
-                    const float wu = dsu * (float)((qu[i] >> shift) & 0xFu) - dmin_u;
-                    g0[r] += wg * y0[i]; u0[r] += wu * y0[i];
-                    if (nj > 1u) { g1[r] += wg * y1[i]; u1[r] += wu * y1[i]; }
-                    if (nj > 2u) { g2[r] += wg * y2[i]; u2[r] += wu * y2[i]; }
-                    if (nj > 3u) { g3[r] += wg * y3[i]; u3[r] += wu * y3[i]; }
-                }
-            }
-        }
-        for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
-            float g = simd_sum(g0[r]), u = simd_sum(u0[r]);
-            if (tiisg == 0) mid[(uint64_t)p0 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
-            if (nj > 1u) {
-                g = simd_sum(g1[r]); u = simd_sum(u1[r]);
-                if (tiisg == 0) mid[(uint64_t)p1 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
-            }
-            if (nj > 2u) {
-                g = simd_sum(g2[r]); u = simd_sum(u2[r]);
-                if (tiisg == 0) mid[(uint64_t)p2 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
-            }
-            if (nj > 3u) {
-                g = simd_sum(g3[r]); u = simd_sum(u3[r]);
-                if (tiisg == 0) mid[(uint64_t)p3 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
-            }
+        switch (nj) {
+        case 1u: qwen4_moe_mid_q4k_pass<NR, 1>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        case 2u: qwen4_moe_mid_q4k_pass<NR, 2>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        case 3u: qwen4_moe_mid_q4k_pass<NR, 3>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        default: qwen4_moe_mid_q4k_pass<NR, 4>(args, gate_base, up_base, x, mid, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
         }
     }
 }
