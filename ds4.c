@@ -78287,7 +78287,12 @@ static void qwen4_batch_row_graph(ds4_qwen4_gpu_graph *out, ds4_session *s,
     if (v->mixed) out->mixed = v->mixed;
 }
 
+/* The Q8 tile computes 32 rows and needs the padding rows to exist in both
+ * operands, so the logits and head rows are sized for at least that many:
+ * the output head then takes the tile at any batch width instead of the
+ * per-token matvec reading its 636 MB once per four rows. */
 static bool qwen4_batch_scratch_ensure(ds4_qwen4_gpu_graph *g, uint32_t rows) {
+    if (rows < 32u) rows = 32u;
     if (g->batch_logits && g->batch_logit_rows >= rows) return true;
     ds4_gpu_tensor_free(g->batch_logits);
     ds4_gpu_tensor_free(g->batch_attn_rows);
@@ -78760,7 +78765,7 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
     uint32_t *ple_ids = xmalloc((size_t)N * DS4_MAX_PLE_HEADS * sizeof(uint32_t));
     bool ok = qwen4_batch_rows_build_ragged(views, mem, count, g);
     for (int i = 0; ok && i < count; i++) qwen4_batch_row_graph(&rowg[i], mem[i].session, &views[i]);
-    if (ok) ok = qwen4_batch_scratch_ensure(g, N > 32u ? N : 32u);
+    if (ok) ok = qwen4_batch_scratch_ensure(g, N);
     if (ok) ok = qwen4_batch_stage_embeddings_ragged(mem, count, N, m, w, g, ple_ids);
     bool ngrams_staged = false;
     for (uint32_t il = 0; ok && il < n_trunk; il++) {
