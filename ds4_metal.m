@@ -48160,6 +48160,8 @@ enum {
     QWEN4_K_ROWS_F32_TO_F16,
     QWEN4_K_DENSE_MM,
     QWEN4_K_DENSE_MM_REDUCE,
+    QWEN4_K_BATCH_MM_Q8_T1,
+    QWEN4_K_BATCH_MM_Q8_T2,
     QWEN4_K_GDN_SCAN_ROWS,
     QWEN4_K_CONV_STREAM_ROWS,
     QWEN4_K_ATTN_PREP_ROWS,
@@ -48261,6 +48263,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_rows_f32_to_f16",
     "kernel_qwen4_dense_mm",
     "kernel_qwen4_dense_mm_reduce",
+    "kernel_qwen4_batch_mm_q8_t1",
+    "kernel_qwen4_batch_mm_q8_t2",
     "kernel_qwen4_gdn_scan_rows",
     "kernel_qwen4_conv_stream_rows",
     "kernel_qwen4_attn_prep_rows",
@@ -50174,6 +50178,47 @@ int ds4_gpu_qwen4_dense_mm_tensor(
     qwen4_bind br[2];
     br[0] = bp[2];
     br[1] = b[2];
+    const uint64_t n = (uint64_t)n_tokens * out_rows;
+    return qwen4_dispatch(QWEN4_K_DENSE_MM_REDUCE, &args, sizeof(args), br, 2,
+                          MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1), 0);
+}
+
+/* Decode batch of 8 or 16 rows against a Q8 matrix (kernel_qwen4_batch_mm_q8):
+ * the k-split gives narrow projections enough simdgroups, the partial planes
+ * are summed by kernel_qwen4_dense_mm_reduce. */
+int ds4_gpu_qwen4_batch_mm_q8_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
+    if ((n_tokens != 8u && n_tokens != 16u) || (in_dim % 32u) != 0 || (out_rows % 32u) != 0 || in_dim == 0) return 0;
+    const uint32_t row_bytes = (in_dim / 32u) * 34u;
+    const uint32_t nk = in_dim / 32u;
+    const uint32_t simdgroups = out_rows / 32u;
+    /* enough simdgroups to cover the machine several times over, no split
+     * shorter than four blocks */
+    const uint32_t target = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_BATCH_MM_SIMDGROUPS", 640u, 32u, 8192u);
+    uint32_t n_split = simdgroups >= target ? 1u : (target + simdgroups - 1u) / simdgroups;
+    if (n_split > nk / 4u) n_split = nk / 4u ? nk / 4u : 1u;
+    if (n_split > 16u) n_split = 16u;
+    struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
+        { n_tokens, in_dim, out_rows, 8u, row_bytes, n_split, 0, 0 };
+    qwen4_bind b[3];
+    if (!qwen4_bind_weight(&b[0], model_map, model_size, weight_offset, (uint64_t)row_bytes * out_rows, "batch mm weight") ||
+        !qwen4_bind_tensor(&b[1], x, (uint64_t)n_tokens * in_dim * sizeof(float), "batch mm input") ||
+        !qwen4_bind_tensor(&b[2], out, (uint64_t)n_tokens * out_rows * sizeof(float), "batch mm output")) {
+        return 0;
+    }
+    const MTLSize grid = MTLSizeMake((out_rows + 127u) / 128u, 1, n_split);
+    const int kernel = n_tokens == 16u ? QWEN4_K_BATCH_MM_Q8_T2 : QWEN4_K_BATCH_MM_Q8_T1;
+    if (n_split <= 1u) {
+        return qwen4_dispatch(kernel, &args, sizeof(args), b, 3, grid, MTLSizeMake(128, 1, 1), 0);
+    }
+    const uint64_t plane = (uint64_t)n_tokens * out_rows * sizeof(float);
+    if (!qwen4_dense_mm_partials_ensure(plane * n_split)) return 0;
+    qwen4_bind bp[3] = { b[0], b[1] };
+    if (!qwen4_bind_tensor(&bp[2], g_qwen4_dense_mm_partials, plane * n_split, "batch mm partials")) return 0;
+    if (!qwen4_dispatch(kernel, &args, sizeof(args), bp, 3, grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+    qwen4_bind br[2] = { bp[2], b[2] };
     const uint64_t n = (uint64_t)n_tokens * out_rows;
     return qwen4_dispatch(QWEN4_K_DENSE_MM_REDUCE, &args, sizeof(args), br, 2,
                           MTLSizeMake((NSUInteger)((n + 255) / 256), 1, 1), MTLSizeMake(256, 1, 1), 0);

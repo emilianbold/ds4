@@ -4142,6 +4142,94 @@ kernel void kernel_qwen4_dense_mm_reduce(
     out[gid] = acc;
 }
 
+/* --- decode batch: Q8 GEMM on fp32 simdgroup matrices ------------------- */
+
+#define QWEN4_BMM_ROWS 32   /* weight rows per simdgroup */
+#define QWEN4_BMM_K 32      /* k per staging step: one q8_0 block per lane */
+
+/* out[t][r] = w[r] . x[t] for a decode batch of 8 or 16 rows.  Every
+ * simdgroup owns 32 weight rows and all the tokens: each lane stages one
+ * q8_0 block of its row (the matvec's d * q values, as floats) into the
+ * simdgroup's own threadgroup memory, then the rows multiply on fp32
+ * simdgroup matrices against token tiles read straight from x.  The weights
+ * are read once for the batch and x once per 32 rows; simdgroups never wait
+ * on each other.  Grid (rows/128, 1, n_split): a k-split writes its plane of
+ * partials for kernel_qwen4_dense_mm_reduce.  The sums are fp32 in another
+ * order than the matvec's. */
+template <uint NTT>   /* token tiles of 8: 1 or 2 */
+kernel void kernel_qwen4_batch_mm_q8(
+        constant ds4_metal_args_qwen4_dense_mm & args,
+        device const char  *w,          /* [out_rows] q8_0 rows */
+        device const float *x,          /* [T][in_dim] */
+        device float       *out,        /* [n_split][T][out_rows] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint row0 = (tgpig.x * 4u + sgitg) * QWEN4_BMM_ROWS;
+    if (row0 >= args.out_rows) return;
+    threadgroup float As[4][QWEN4_BMM_ROWS * QWEN4_BMM_K];
+    threadgroup float *A = As[sgitg];
+    /* every matrix index below is a compile-time constant: a dynamically
+     * indexed simdgroup matrix leaves the registers */
+    simdgroup_float8x8 C[4][NTT];
+#pragma unroll
+    for (uint i = 0; i < 4; i++) {
+#pragma unroll
+        for (uint j = 0; j < NTT; j++) C[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    device const char *row = w + (uint64_t)(row0 + tiisg) * args.row_bytes;
+    const uint nk = args.in_dim / QWEN4_BMM_K;
+    const uint nsplit = args.n_split ? args.n_split : 1u;
+    const uint kb_lo = (uint)(((uint64_t)tgpig.z * nk) / nsplit);
+    const uint kb_hi = (uint)(((uint64_t)(tgpig.z + 1u) * nk) / nsplit);
+    for (uint kb = kb_lo; kb < kb_hi; kb++) {
+        {
+            device const char *blk = row + (uint64_t)kb * 34u;
+            const float d = (float)(*(device const half *)blk);
+            device const ushort *qs16 = (device const ushort *)(blk + 2);
+            threadgroup float *dst = A + tiisg * QWEN4_BMM_K;
+#pragma unroll
+            for (uint i = 0; i < 16; i++) {
+                const ushort u = qs16[i];
+                dst[2 * i] = ((float)(int8_t)(u & 0xFFu)) * d;
+                dst[2 * i + 1] = ((float)(int8_t)(u >> 8)) * d;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint ks = 0; ks < 4; ks++) {
+            simdgroup_float8x8 b[NTT];
+#pragma unroll
+            for (uint j = 0; j < NTT; j++) {
+                simdgroup_load(b[j], x + (uint64_t)(j * 8) * args.in_dim + kb * QWEN4_BMM_K + ks * 8, args.in_dim, 0, true);
+            }
+#pragma unroll
+            for (uint i = 0; i < 4; i++) {
+                simdgroup_float8x8 a;
+                simdgroup_load(a, A + (i * 8) * QWEN4_BMM_K + ks * 8, QWEN4_BMM_K, 0, false);
+#pragma unroll
+                for (uint j = 0; j < NTT; j++) simdgroup_multiply_accumulate(C[i][j], a, b[j], C[i][j]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float *plane = out + (uint64_t)tgpig.z * args.n_tokens * args.out_rows;
+#pragma unroll
+    for (uint i = 0; i < 4; i++) {
+#pragma unroll
+        for (uint j = 0; j < NTT; j++) {
+            simdgroup_store(C[i][j], plane + (uint64_t)(j * 8) * args.out_rows + row0 + i * 8, args.out_rows, 0, true);
+        }
+    }
+}
+
+#define QWEN4_BATCH_MM_INSTANCE(NTT_) \
+template [[host_name("kernel_qwen4_batch_mm_q8_t" #NTT_)]] \
+kernel void kernel_qwen4_batch_mm_q8<NTT_>(constant ds4_metal_args_qwen4_dense_mm &, device const char *, \
+        device const float *, device float *, uint3, ushort, ushort);
+QWEN4_BATCH_MM_INSTANCE(1)
+QWEN4_BATCH_MM_INSTANCE(2)
+
 struct ds4_metal_args_qwen4_hc_mix_rows {
     uint32_t n_tokens;
     uint32_t n_embd;

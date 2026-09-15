@@ -3422,6 +3422,38 @@ static void test_half_expert_tiles(arena_t *a, uint32_t T, uint32_t type, uint32
 #endif
 
 /* dense tiled GEMM against a double reference for f32, f16 and q8_0 rows */
+/* The decode-batch Q8 GEMM: reference in double, and the same sums the
+ * per-token matvec finds, to rounding. */
+static void test_batch_mm_q8(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T) {
+    double *sh;
+    const uint64_t off = arena_q8_0(a, rows, in_dim, &sh, 0.05f);
+    float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    double *ref = malloc((uint64_t)T * rows * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t r = 0; r < rows; r++) {
+            double acc = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) acc += sh[(uint64_t)r * in_dim + k] * x[(uint64_t)t * in_dim + k];
+            ref[(uint64_t)t * rows + r] = acc;
+        }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+    ds4_gpu_tensor *gout = upload(NULL, (uint64_t)T * rows), *gmv = upload(NULL, (uint64_t)T * rows);
+    require_ok(ds4_gpu_qwen4_batch_mm_q8_tensor(gout, gx, a->base, a->size, off, T, in_dim, rows), "batch mm q8");
+    require_ok(ds4_gpu_qwen4_matmul_q8_0_tensor(gmv, a->base, a->size, off, in_dim, rows, gx, T), "batch mm q8 matvec");
+    char name[96];
+    snprintf(name, sizeof(name), "batch mm q8 %ux%u T=%u", rows, in_dim, T);
+    check_tensor(name, gout, ref, (uint64_t)T * rows, 3e-5);
+    float *am = download(gout, (uint64_t)T * rows), *bm = download(gmv, (uint64_t)T * rows);
+    double worst = 0.0, scale = 0.0;
+    for (uint64_t i = 0; i < (uint64_t)T * rows; i++) {
+        const double d = fabs((double)am[i] - (double)bm[i]);
+        if (d > worst) worst = d;
+        if (fabs((double)bm[i]) > scale) scale = fabs((double)bm[i]);
+    }
+    require_ok(worst <= 2e-6 * scale + 1e-6, "batch mm q8 within rounding of the matvec");
+    free(bm); free(am); free(ref); free(x); free(sh);
+    ds4_gpu_tensor_free(gmv); ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
+}
+
 static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T, uint32_t wtype) {
     double *sh;
     uint64_t off = wtype == 8u ? arena_q8_0(a, rows, in_dim, &sh, 0.05f)
@@ -3625,6 +3657,9 @@ int main(void) {
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
+    test_batch_mm_q8(&arena, 2560, 640, 16);
+    test_batch_mm_q8(&arena, 6144, 2560, 16);
+    test_batch_mm_q8(&arena, 2560, 128, 8);
     test_dense_mm(&arena, 10240, 320, 33, 1u);
     test_dense_mm(&arena, 320, 10240, 40, 1u);
     test_dense_mm(&arena, 2560, 100, 9, 8u);

@@ -58157,6 +58157,16 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
                                            (uint32_t)in_dim, (uint32_t)out_dim);
         if (rc) return true;
     }
+    /* Q8 decode batches of 8 or 16 rows on fp32 simdgroup matrices: the
+     * per-token kernel reads the matrix once per four rows and streams x
+     * once per four weight rows; this reads the weights once and x once per
+     * 32 rows.  DS4_QWEN4_NO_BATCH_MM=1 keeps the per-token kernel for A/B. */
+    if (!legacy && w->type == DS4_TENSOR_Q8_0 && (n_tok == 8u || n_tok == 16u) &&
+        (in_dim % 32) == 0 && (out_dim % 32) == 0 && getenv("DS4_QWEN4_NO_BATCH_MM") == NULL) {
+        rc = ds4_gpu_qwen4_batch_mm_q8_tensor(out, x, m->map, m->size, w->abs_offset, n_tok,
+                                              (uint32_t)in_dim, (uint32_t)out_dim);
+        if (rc) return true;
+    }
     switch (w->type) {
     case DS4_TENSOR_Q8_0: rc = ds4_gpu_qwen4_matmul_q8_0_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_F16:  rc = ds4_gpu_matmul_f16_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
