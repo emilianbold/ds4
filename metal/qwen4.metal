@@ -3177,6 +3177,8 @@ static inline void qwen4_moe_down_mxfp4_pass(
         constant ds4_metal_args_qwen4_moe & args,
         device const char *down_base, device const float *mid, device float *part,
         device const int32_t *list, uint64_t ebase, uint row0, uint nb, uint ix, uint it, ushort tiisg) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
     uint pairs[NJ];
     device const float *ms[NJ];
 #pragma unroll
@@ -3184,36 +3186,70 @@ static inline void qwen4_moe_down_mxfp4_pass(
         pairs[j] = (uint)list[j];
         ms[j] = mid + (uint64_t)pairs[j] * args.in_dim;
     }
-    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
-#pragma clang fp reassociate(off)
-#pragma clang fp contract(off)
-        device const uchar *row = (device const uchar *)(down_base + ebase + (uint64_t)r * args.row_bytes);
-        float acc[NJ];
+    /* both rows of the simdgroup walk their blocks together: two
+     * independent chains per pair in flight instead of one after the other;
+     * each chain's own order is the per-token kernel's */
+    const bool two = row0 + 1u < args.out_rows;
+    device const uchar *rowa = (device const uchar *)(down_base + ebase + (uint64_t)row0 * args.row_bytes);
+    device const uchar *rowb = rowa + (two ? args.row_bytes : 0u);
+    float acca[NJ], accb[NJ];
 #pragma unroll
-        for (uint j = 0; j < NJ; j++) acc[j] = 0.0f;
-        uint ib = ix;
-        for (; ib + 12u < nb; ib += 16u) {
-            device const uchar *b0 = row + (uint64_t)ib * 17u;
-            device const uchar *b1 = b0 + 4u * 17u, *b2 = b0 + 8u * 17u, *b3 = b0 + 12u * 17u;
-            const uchar e0 = b0[0], e1 = b1[0], e2 = b2[0], e3 = b3[0];
-            const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
-            const uint p1 = b1[1 + it * 2u], q1 = b1[2 + it * 2u];
-            const uint p2 = b2[1 + it * 2u], q2 = b2[2 + it * 2u];
-            const uint p3 = b3[1 + it * 2u], q3 = b3[2 + it * 2u];
-#pragma unroll
-            for (uint j = 0; j < NJ; j++) QWEN4_MXFP4_GROUPED_ROWS(acc[j], ms[j], ib);
-        }
-        for (; ib < nb; ib += 4u) {
-            device const uchar *b0 = row + (uint64_t)ib * 17u;
-            const uchar e0 = b0[0];
-            const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
-#pragma unroll
-            for (uint j = 0; j < NJ; j++) QWEN4_MXFP4_GROUPED_TAIL(acc[j], ms[j], ib);
-        }
+    for (uint j = 0; j < NJ; j++) { acca[j] = 0.0f; accb[j] = 0.0f; }
+    uint ib = ix;
+    for (; ib + 12u < nb; ib += 16u) {
+        device const uchar *a0 = rowa + (uint64_t)ib * 17u;
+        device const uchar *a1 = a0 + 4u * 17u, *a2 = a0 + 8u * 17u, *a3 = a0 + 12u * 17u;
+        device const uchar *c0 = rowb + (uint64_t)ib * 17u;
+        device const uchar *c1 = c0 + 4u * 17u, *c2 = c0 + 8u * 17u, *c3 = c0 + 12u * 17u;
+        const uchar ea0 = a0[0], ea1 = a1[0], ea2 = a2[0], ea3 = a3[0];
+        const uint pa0 = a0[1 + it * 2u], qa0 = a0[2 + it * 2u];
+        const uint pa1 = a1[1 + it * 2u], qa1 = a1[2 + it * 2u];
+        const uint pa2 = a2[1 + it * 2u], qa2 = a2[2 + it * 2u];
+        const uint pa3 = a3[1 + it * 2u], qa3 = a3[2 + it * 2u];
+        const uchar eb0 = c0[0], eb1 = c1[0], eb2 = c2[0], eb3 = c3[0];
+        const uint pb0 = c0[1 + it * 2u], qb0 = c0[2 + it * 2u];
+        const uint pb1 = c1[1 + it * 2u], qb1 = c1[2 + it * 2u];
+        const uint pb2 = c2[1 + it * 2u], qb2 = c2[2 + it * 2u];
+        const uint pb3 = c3[1 + it * 2u], qb3 = c3[2 + it * 2u];
 #pragma unroll
         for (uint j = 0; j < NJ; j++) {
-            const float v = simd_sum(acc[j]);
-            if (tiisg == 0) part[(uint64_t)pairs[j] * args.out_rows + r] = v;
+            device const float *y0 = ms[j] + ib * 32u + it * 2u;
+            device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u;
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17];
+            const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17];
+            const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17];
+            QWEN4_MXFP4_PF_ACC_TO(acca[j], ea0, pa0, qa0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(acca[j], ea1, pa1, qa1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(acca[j], ea2, pa2, qa2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(acca[j], ea3, pa3, qa3, y3a, y3b, y3c, y3d);
+            QWEN4_MXFP4_PF_ACC_TO(accb[j], eb0, pb0, qb0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accb[j], eb1, pb1, qb1, y1a, y1b, y1c, y1d);
+            QWEN4_MXFP4_PF_ACC_TO(accb[j], eb2, pb2, qb2, y2a, y2b, y2c, y2d);
+            QWEN4_MXFP4_PF_ACC_TO(accb[j], eb3, pb3, qb3, y3a, y3b, y3c, y3d);
+        }
+    }
+    for (; ib < nb; ib += 4u) {
+        device const uchar *a0 = rowa + (uint64_t)ib * 17u;
+        device const uchar *c0 = rowb + (uint64_t)ib * 17u;
+        const uchar ea0 = a0[0], eb0 = c0[0];
+        const uint pa0 = a0[1 + it * 2u], qa0 = a0[2 + it * 2u];
+        const uint pb0 = c0[1 + it * 2u], qb0 = c0[2 + it * 2u];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            device const float *y0 = ms[j] + ib * 32u + it * 2u;
+            const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17];
+            QWEN4_MXFP4_PF_ACC_TO(acca[j], ea0, pa0, qa0, y0a, y0b, y0c, y0d);
+            QWEN4_MXFP4_PF_ACC_TO(accb[j], eb0, pb0, qb0, y0a, y0b, y0c, y0d);
+        }
+    }
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        const float va = simd_sum(acca[j]);
+        const float vb = simd_sum(accb[j]);
+        if (tiisg == 0) {
+            part[(uint64_t)pairs[j] * args.out_rows + row0] = va;
+            if (two) part[(uint64_t)pairs[j] * args.out_rows + row0 + 1u] = vb;
         }
     }
 }
