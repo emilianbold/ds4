@@ -3151,6 +3151,75 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
     }
 }
 
+#define QWEN4_MXFP4_GROUPED_ROWS(ACC_, M_, IB_) do { \
+    device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
+    device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u; \
+    const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17]; \
+    const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17]; \
+    const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17]; \
+    const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17]; \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e0, p0, q0, y0a, y0b, y0c, y0d); \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e1, p1, q1, y1a, y1b, y1c, y1d); \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e2, p2, q2, y2a, y2b, y2c, y2d); \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e3, p3, q3, y3a, y3b, y3c, y3d); \
+} while (0)
+#define QWEN4_MXFP4_GROUPED_TAIL(ACC_, M_, IB_) do { \
+    device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
+    const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17]; \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e0, p0, q0, y0a, y0b, y0c, y0d); \
+} while (0)
+
+/* One pass of the grouped down kernel over NJ pairs of one expert: the
+ * per-token kernel's prefetched chain per row, one named accumulator per
+ * pair, no per-pair branch inside the block loop. */
+template <uint NJ>
+static inline void qwen4_moe_down_mxfp4_pass(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *down_base, device const float *mid, device float *part,
+        device const int32_t *list, uint64_t ebase, uint row0, uint nb, uint ix, uint it, ushort tiisg) {
+    uint pairs[NJ];
+    device const float *ms[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        pairs[j] = (uint)list[j];
+        ms[j] = mid + (uint64_t)pairs[j] * args.in_dim;
+    }
+    for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+        device const uchar *row = (device const uchar *)(down_base + ebase + (uint64_t)r * args.row_bytes);
+        float acc[NJ];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) acc[j] = 0.0f;
+        uint ib = ix;
+        for (; ib + 12u < nb; ib += 16u) {
+            device const uchar *b0 = row + (uint64_t)ib * 17u;
+            device const uchar *b1 = b0 + 4u * 17u, *b2 = b0 + 8u * 17u, *b3 = b0 + 12u * 17u;
+            const uchar e0 = b0[0], e1 = b1[0], e2 = b2[0], e3 = b3[0];
+            const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
+            const uint p1 = b1[1 + it * 2u], q1 = b1[2 + it * 2u];
+            const uint p2 = b2[1 + it * 2u], q2 = b2[2 + it * 2u];
+            const uint p3 = b3[1 + it * 2u], q3 = b3[2 + it * 2u];
+#pragma unroll
+            for (uint j = 0; j < NJ; j++) QWEN4_MXFP4_GROUPED_ROWS(acc[j], ms[j], ib);
+        }
+        for (; ib < nb; ib += 4u) {
+            device const uchar *b0 = row + (uint64_t)ib * 17u;
+            const uchar e0 = b0[0];
+            const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
+#pragma unroll
+            for (uint j = 0; j < NJ; j++) QWEN4_MXFP4_GROUPED_TAIL(acc[j], ms[j], ib);
+        }
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            const float v = simd_sum(acc[j]);
+            if (tiisg == 0) part[(uint64_t)pairs[j] * args.out_rows + r] = v;
+        }
+    }
+}
+#undef QWEN4_MXFP4_GROUPED_ROWS
+#undef QWEN4_MXFP4_GROUPED_TAIL
+
 /* kernel_qwen4_moe_down_mxfp4_pf over the batch's distinct experts, on the
  * same list ownership as kernel_qwen4_moe_mid_q4k_grouped: the owning
  * threadgroup walks each of its rows once per four pairs of the list, every
@@ -3185,68 +3254,18 @@ kernel void kernel_qwen4_moe_down_mxfp4_grouped(
     const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
     const uint ix = tiisg / 8, it = tiisg % 8;
     const uint nb = args.in_dim / 32;
-#define QWEN4_MXFP4_GROUPED_ROWS(ACC_, M_, IB_) do { \
-    device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
-    device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u; \
-    const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17]; \
-    const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17]; \
-    const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17]; \
-    const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17]; \
-    QWEN4_MXFP4_PF_ACC_TO(ACC_, e0, p0, q0, y0a, y0b, y0c, y0d); \
-    QWEN4_MXFP4_PF_ACC_TO(ACC_, e1, p1, q1, y1a, y1b, y1c, y1d); \
-    QWEN4_MXFP4_PF_ACC_TO(ACC_, e2, p2, q2, y2a, y2b, y2c, y2d); \
-    QWEN4_MXFP4_PF_ACC_TO(ACC_, e3, p3, q3, y3a, y3b, y3c, y3d); \
-} while (0)
-#define QWEN4_MXFP4_GROUPED_TAIL(ACC_, M_, IB_) do { \
-    device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
-    const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17]; \
-    QWEN4_MXFP4_PF_ACC_TO(ACC_, e0, p0, q0, y0a, y0b, y0c, y0d); \
-} while (0)
-    /* Up to four pairs per pass with named accumulators (see the mid kernel). */
+    /* Up to four pairs per pass, the count a template constant (see the mid
+     * kernel). */
     for (uint j0 = 0; j0 < count; j0 += 4u) {
         const uint nj = min(4u, count - j0);
-        const uint pr0 = (uint)list[j0], pr1 = (uint)list[j0 + min(1u, nj - 1u)];
-        const uint pr2 = (uint)list[j0 + min(2u, nj - 1u)], pr3 = (uint)list[j0 + min(3u, nj - 1u)];
-        device const float *m0 = mid + (uint64_t)pr0 * args.in_dim, *m1 = mid + (uint64_t)pr1 * args.in_dim;
-        device const float *m2 = mid + (uint64_t)pr2 * args.in_dim, *m3 = mid + (uint64_t)pr3 * args.in_dim;
-        for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
-#pragma clang fp reassociate(off)
-#pragma clang fp contract(off)
-            device const uchar *row = (device const uchar *)(down_base + ebase + (uint64_t)r * args.row_bytes);
-            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
-            uint ib = ix;
-            for (; ib + 12u < nb; ib += 16u) {
-                device const uchar *b0 = row + (uint64_t)ib * 17u;
-                device const uchar *b1 = b0 + 4u * 17u, *b2 = b0 + 8u * 17u, *b3 = b0 + 12u * 17u;
-                const uchar e0 = b0[0], e1 = b1[0], e2 = b2[0], e3 = b3[0];
-                const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
-                const uint p1 = b1[1 + it * 2u], q1 = b1[2 + it * 2u];
-                const uint p2 = b2[1 + it * 2u], q2 = b2[2 + it * 2u];
-                const uint p3 = b3[1 + it * 2u], q3 = b3[2 + it * 2u];
-                QWEN4_MXFP4_GROUPED_ROWS(acc0, m0, ib);
-                if (nj > 1u) QWEN4_MXFP4_GROUPED_ROWS(acc1, m1, ib);
-                if (nj > 2u) QWEN4_MXFP4_GROUPED_ROWS(acc2, m2, ib);
-                if (nj > 3u) QWEN4_MXFP4_GROUPED_ROWS(acc3, m3, ib);
-            }
-            for (; ib < nb; ib += 4u) {
-                device const uchar *b0 = row + (uint64_t)ib * 17u;
-                const uchar e0 = b0[0];
-                const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
-                QWEN4_MXFP4_GROUPED_TAIL(acc0, m0, ib);
-                if (nj > 1u) QWEN4_MXFP4_GROUPED_TAIL(acc1, m1, ib);
-                if (nj > 2u) QWEN4_MXFP4_GROUPED_TAIL(acc2, m2, ib);
-                if (nj > 3u) QWEN4_MXFP4_GROUPED_TAIL(acc3, m3, ib);
-            }
-            float v = simd_sum(acc0);
-            if (tiisg == 0) part[(uint64_t)pr0 * args.out_rows + r] = v;
-            if (nj > 1u) { v = simd_sum(acc1); if (tiisg == 0) part[(uint64_t)pr1 * args.out_rows + r] = v; }
-            if (nj > 2u) { v = simd_sum(acc2); if (tiisg == 0) part[(uint64_t)pr2 * args.out_rows + r] = v; }
-            if (nj > 3u) { v = simd_sum(acc3); if (tiisg == 0) part[(uint64_t)pr3 * args.out_rows + r] = v; }
+        switch (nj) {
+        case 1u: qwen4_moe_down_mxfp4_pass<1>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        case 2u: qwen4_moe_down_mxfp4_pass<2>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        case 3u: qwen4_moe_down_mxfp4_pass<3>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
+        default: qwen4_moe_down_mxfp4_pass<4>(args, down_base, mid, part, list + j0, ebase, row0, nb, ix, it, tiisg); break;
         }
     }
 }
-#undef QWEN4_MXFP4_GROUPED_ROWS
-#undef QWEN4_MXFP4_GROUPED_TAIL
 
 struct ds4_metal_args_qwen4_moe_reduce {
     uint32_t n_tokens;
