@@ -79884,7 +79884,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         size_t errlen);
 
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
-                                               int (*accepted)[2], int *n_accepted,
+                                               int (*accepted)[3], int *n_accepted,
                                                char *err, size_t errlen) {
     if (!items || count <= 0 || !accepted || !n_accepted) {
         if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
@@ -79907,7 +79907,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                 return 1;
             }
         }
-        if (s->checkpoint.len + 2 > s->ctx_size) {
+        if (s->checkpoint.len + 3 > s->ctx_size) {
             if (err && errlen) snprintf(err, errlen, "decode batch item %d reached its context limit", i);
             return 1;
         }
@@ -80008,6 +80008,7 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             n_accepted[i] = (int)committed[i];
             accepted[i][0] = mem[i].tokens[0];
             accepted[i][1] = committed[i] == 2u ? mem[i].tokens[1] : -1;
+            accepted[i][2] = -1;
         }
         /* the next drafts: a session at its context limit simply gets none */
         bool room = true;
@@ -80028,16 +80029,14 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
 #endif
     /* Sequential fallback: one speculative cycle per session. */
     for (int i = 0; i < count; i++) {
-        int toks[3];
-        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, 2, -1,
-                                                          toks, 2, err, errlen);
+        const int n = ds4_session_eval_speculative_argmax(items[i].session, items[i].token, 3, -1,
+                                                          accepted[i], 3, err, errlen);
         if (n <= 0) {
             for (int j = 0; j < count; j++) ds4_session_invalidate(items[j].session);
             return 1;
         }
         n_accepted[i] = n;
-        accepted[i][0] = toks[0];
-        accepted[i][1] = n > 1 ? toks[1] : -1;
+        for (int k = n; k < 3; k++) accepted[i][k] = -1;
     }
     return 0;
 }

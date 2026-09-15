@@ -53,6 +53,7 @@ enum {
     DEFAULT_MIXED_STEPS = 64,
     DEFAULT_MIXED_QUANTUM = 128,
     CTX_MARGIN = 16,
+    SPEC_MAX_TOKENS = 3,    /* a speculative cycle commits the token plus up to two drafts */
 };
 
 /* Held back so the sweep never pushes the machine into compression or swap. */
@@ -353,7 +354,7 @@ static int measure_decode(const bench_env *env,
                           int *tokens_out,
                           long *produced_out) {
     ds4_decode_item items[MAX_STREAMS];
-    int accepted[MAX_STREAMS][2], n_accepted[MAX_STREAMS];
+    int accepted[MAX_STREAMS][SPEC_MAX_TOKENS], n_accepted[MAX_STREAMS];
     char err[256] = {0};
     double eval_sec = 0.0;
     long produced = 0;
@@ -362,7 +363,7 @@ static int measure_decode(const bench_env *env,
     for (int step = 0; step < steps; step++) {
         for (int i = 0; i < count; i++) {
             ds4_session *s = sessions[i];
-            if (ds4_session_pos(s) + (env->spec ? 2 : 1) >= ds4_session_ctx(s)) {
+            if (ds4_session_pos(s) + (env->spec ? SPEC_MAX_TOKENS : 1) >= ds4_session_ctx(s)) {
                 fprintf(stderr, BENCH ": stream %d reached its context limit\n", i);
                 return 1;
             }
@@ -411,9 +412,9 @@ static bool verify_spec_matches_plain(const bench_env *env,
                                       int count,
                                       int cycles) {
     ds4_decode_item items[MAX_STREAMS];
-    int accepted[MAX_STREAMS][2], n_accepted[MAX_STREAMS];
+    int accepted[MAX_STREAMS][SPEC_MAX_TOKENS], n_accepted[MAX_STREAMS];
     char err[256] = {0};
-    int *seq = calloc((size_t)count * (size_t)cycles * 2u, sizeof(int));
+    int *seq = calloc((size_t)count * (size_t)cycles * SPEC_MAX_TOKENS, sizeof(int));
     int len[MAX_STREAMS] = {0};
     long committed = 0;
     if (!seq) return false;
@@ -428,7 +429,7 @@ static bool verify_spec_matches_plain(const bench_env *env,
             return false;
         }
         for (int i = 0; i < count; i++) {
-            for (int k = 0; k < n_accepted[i]; k++) seq[(size_t)i * cycles * 2 + len[i]++] = accepted[i][k];
+            for (int k = 0; k < n_accepted[i]; k++) seq[(size_t)i * cycles * SPEC_MAX_TOKENS + len[i]++] = accepted[i][k];
             committed += n_accepted[i];
         }
     }
@@ -442,7 +443,7 @@ static bool verify_spec_matches_plain(const bench_env *env,
         for (int i = 0; i < count; i++) {
             if (k >= len[i]) continue;
             const int token = ds4_session_argmax_excluding(reference[i], env->eos);
-            const int want = seq[(size_t)i * cycles * 2 + k];
+            const int want = seq[(size_t)i * cycles * SPEC_MAX_TOKENS + k];
             if (token != want) {
                 fprintf(stderr, BENCH ": spec verify failed: stream %d token %d: speculative %d, plain %d\n",
                         i, k, want, token);
@@ -653,7 +654,7 @@ static void run_cell(const bench_config *cfg,
     const int decode_budget = cfg->warmup + cfg->gen + ab_steps +
                               (cfg->mixed ? cfg->mixed_steps : 0);
     /* a speculative cycle can commit two tokens per stream */
-    const int ctx_alloc = prompt_tokens + decode_budget * (cfg->spec ? 2 : 1) + CTX_MARGIN;
+    const int ctx_alloc = prompt_tokens + decode_budget * (cfg->spec ? SPEC_MAX_TOKENS : 1) + CTX_MARGIN;
     const int session_count = concurrency + (cfg->mixed ? 1 : 0);
     const int total_sessions = cfg->verify ? session_count * 2 : session_count;
 
@@ -1056,7 +1057,7 @@ int main(int argc, char **argv) {
     }
 
     const int max_alloc = (max_ctx > 0 ? max_ctx : 1) +
-                          (cfg.warmup + cfg.gen + (cfg.candidate_env ? cfg.gen * 2 * cfg.repeat : 0)) * (cfg.spec ? 2 : 1) +
+                          (cfg.warmup + cfg.gen + (cfg.candidate_env ? cfg.gen * 2 * cfg.repeat : 0)) * (cfg.spec ? SPEC_MAX_TOKENS : 1) +
                           (cfg.mixed ? cfg.mixed_steps : 0) + CTX_MARGIN;
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
