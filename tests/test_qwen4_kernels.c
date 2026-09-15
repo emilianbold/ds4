@@ -2041,6 +2041,47 @@ static void test_mv_ext_groups(arena_t *a) {
     printf("few-row matvec simdgroup counts: Q8 and F16 verify-row shapes exact at 1/2/4/8 groups\n");
 }
 
+/* The grouped decode-batch kernels must reproduce the per-token kernels bit
+ * for bit under heavy expert reuse (sixteen rows over eight experts). */
+static void test_moe_grouped(arena_t *a) {
+    const uint32_t NE = 8, slots = 6, E = 2560, F = 640, T = 16, cap = 64;
+    double *gate_w, *up_w, *down_w;
+    const uint64_t gate_off = arena_q4_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
+    const uint64_t up_off = arena_q4_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
+    const uint64_t down_off = arena_mxfp4(a, (uint64_t)NE * E, F, &down_w);
+    free(gate_w); free(up_w); free(down_w);
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++) {
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 7u + s * 3u) % NE);
+    }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * cap * 4), *gcounts = ds4_gpu_tensor_alloc((uint64_t)NE * 4);
+    ds4_gpu_tensor *gmid[2] = { upload(NULL, (uint64_t)T * slots * F), upload(NULL, (uint64_t)T * slots * F) };
+    ds4_gpu_tensor *gpart[2] = { upload(NULL, (uint64_t)T * slots * E), upload(NULL, (uint64_t)T * slots * E) };
+    require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "grouped sel");
+    require_ok(ds4_gpu_qwen4_moe_mid_tensor(gmid[0], gx, gsel, a->base, a->size, gate_off, up_off, 12u, NE, T, slots, E, F,
+                                            0, 0, UINT32_MAX), "grouped: per-token mid");
+    require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart[0], gmid[0], gsel, a->base, a->size, down_off, 39u, NE, T, slots, F, E,
+                                             0, UINT32_MAX), "grouped: per-token down");
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, cap), "grouped: lists");
+    require_ok(ds4_gpu_qwen4_moe_mid_grouped_tensor(gmid[1], gx, gsel, glists, gcounts, cap, a->base, a->size, gate_off,
+                                                    up_off, 12u, NE, T, slots, E, F), "grouped: mid");
+    require_ok(ds4_gpu_qwen4_moe_down_grouped_tensor(gpart[1], gmid[0], gsel, glists, gcounts, cap, a->base, a->size,
+                                                     down_off, 39u, NE, T, slots, F, E), "grouped: down");
+    const uint64_t nm = (uint64_t)T * slots * F, np = (uint64_t)T * slots * E;
+    float *am = download(gmid[0], nm), *bm = download(gmid[1], nm);
+    float *ap = download(gpart[0], np), *bp = download(gpart[1], np);
+    check_exact_f32("grouped Q4_K mid", bm, am, nm);
+    check_exact_f32("grouped MXFP4 down", bp, ap, np);
+    printf("  MoE grouped kernels: mid and down byte-exact against the per-token kernels under expert reuse\n");
+    free(bp); free(ap); free(bm); free(am);
+    for (int i = 0; i < 2; i++) { ds4_gpu_tensor_free(gpart[i]); ds4_gpu_tensor_free(gmid[i]); }
+    ds4_gpu_tensor_free(gcounts); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gx);
+    free(sel); free(x);
+}
+
 static void test_hc_pair_groups(arena_t *a) {
     const uint32_t types[] = {1u, 0u, 8u}, widths[] = {9u, 64u, 2560u};
     const char *groups[] = {"4", "1", "2", "8", "16"};
@@ -3517,6 +3558,7 @@ int main(void) {
     test_qwen4_argmax();
     test_hc_pair_groups(&arena);
     test_mv_ext_groups(&arena);
+    test_moe_grouped(&arena);
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
     test_hc(&arena, 2560, 320, 2, 1u);

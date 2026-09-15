@@ -2472,6 +2472,8 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t shared_type;
     uint32_t shared_row_bytes;
     uint32_t n_total_expert;
+    uint32_t list_cap;     /* grouped kernels: row stride of the per-expert pair lists */
+    uint32_t pad0;
 };
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
@@ -2776,6 +2778,124 @@ kernel void kernel_qwen4_moe_mid_q4k<NR_>(constant ds4_metal_args_qwen4_moe &, \
 QWEN4_MOE_MID_Q4K_INSTANCE(2, "kernel_qwen4_moe_mid_q4k")
 QWEN4_MOE_MID_Q4K_INSTANCE(1, "kernel_qwen4_moe_mid_q4k_nr1")
 
+/* A decode batch over its distinct experts: the threadgroup of the first
+ * (token, slot) pair in an expert's list computes its rows for every pair in
+ * the list, four pairs per pass, so an expert's rows are read once per four
+ * tokens that chose it instead of once per token.  Every token keeps its own
+ * accumulators and block walk, so its outputs are kernel_qwen4_moe_mid_q4k's
+ * bit for bit; the other pairs of the list return at once.  No shared slot:
+ * the batch runs the shared expert as dense projections. */
+template <uint NR>
+kernel void kernel_qwen4_moe_mid_q4k_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base,
+        device const char *up_base,
+        device const int32_t *selected,
+        device const float *x,
+        device float *mid,
+        device const int32_t *lists,     /* [n_total_expert][list_cap]: t*n_slots + slot */
+        device const int32_t *counts,    /* [n_total_expert] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) mid[(uint64_t)pair * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
+    const uint count = min((uint)counts[expert], args.list_cap);
+    if (count == 0 || (uint)list[0] != pair) return;
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint nb = args.in_dim / 256;
+    const uint group = tiisg / 4, l = (tiisg % 4) * 8;
+    const uint shift = (group & 1u) * 4u;
+    /* Up to four pairs per pass, each with its own named accumulators: an
+     * array indexed by the pair would leave the registers. */
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        const uint nj = min(4u, count - j0);
+        const uint p0 = (uint)list[j0], p1 = (uint)list[j0 + min(1u, nj - 1u)];
+        const uint p2 = (uint)list[j0 + min(2u, nj - 1u)], p3 = (uint)list[j0 + min(3u, nj - 1u)];
+        device const float *x0 = x + (uint64_t)(p0 / args.n_slots) * args.in_dim;
+        device const float *x1 = x + (uint64_t)(p1 / args.n_slots) * args.in_dim;
+        device const float *x2 = x + (uint64_t)(p2 / args.n_slots) * args.in_dim;
+        device const float *x3 = x + (uint64_t)(p3 / args.n_slots) * args.in_dim;
+        float g0[NR], u0[NR], g1[NR], u1[NR], g2[NR], u2[NR], g3[NR], u3[NR];
+        for (uint r = 0; r < NR; r++) {
+            g0[r] = u0[r] = g1[r] = u1[r] = g2[r] = u2[r] = g3[r] = u3[r] = 0.0f;
+        }
+        for (uint ib = 0; ib < nb; ib++) {
+            const uint yo = ib * 256 + group * 32 + l;
+            float y0[8], y1[8], y2[8], y3[8];
+            for (uint i = 0; i < 8; i++) y0[i] = x0[yo + i];
+            if (nj > 1u) for (uint i = 0; i < 8; i++) y1[i] = x1[yo + i];
+            if (nj > 2u) for (uint i = 0; i < 8; i++) y2[i] = x2[yo + i];
+            if (nj > 3u) for (uint i = 0; i < 8; i++) y3[i] = x3[yo + i];
+            for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+                const uint64_t off = ebase + (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144;
+                device const uchar *bg = (device const uchar *)(gate_base + off);
+                device const uchar *bu = (device const uchar *)(up_base + off);
+                const float dg = (float)(*(device const half *)bg);
+                const float dmg = (float)(*(device const half *)(bg + 2));
+                const float du = (float)(*(device const half *)bu);
+                const float dmu = (float)(*(device const half *)(bu + 2));
+                device const uchar *scg = bg + 4;
+                device const uchar *scu = bu + 4;
+                uint sg, mg, su, mu;
+                if (group < 4) {
+                    sg = scg[group] & 63u; mg = scg[group + 4] & 63u;
+                    su = scu[group] & 63u; mu = scu[group + 4] & 63u;
+                } else {
+                    sg = (scg[group + 4] & 0xFu) | ((scg[group - 4] & 0xC0u) >> 2);
+                    mg = (scg[group + 4] >> 4) | ((scg[group] & 0xC0u) >> 2);
+                    su = (scu[group + 4] & 0xFu) | ((scu[group - 4] & 0xC0u) >> 2);
+                    mu = (scu[group + 4] >> 4) | ((scu[group] & 0xC0u) >> 2);
+                }
+                const float dsg = dg * (float)sg, dmin_g = dmg * (float)mg;
+                const float dsu = du * (float)su, dmin_u = dmu * (float)mu;
+                device const uchar *qg = bg + 16 + (group >> 1) * 32 + l;
+                device const uchar *qu = bu + 16 + (group >> 1) * 32 + l;
+                for (uint i = 0; i < 8; i++) {
+                    const float wg = dsg * (float)((qg[i] >> shift) & 0xFu) - dmin_g;
+                    const float wu = dsu * (float)((qu[i] >> shift) & 0xFu) - dmin_u;
+                    g0[r] += wg * y0[i]; u0[r] += wu * y0[i];
+                    if (nj > 1u) { g1[r] += wg * y1[i]; u1[r] += wu * y1[i]; }
+                    if (nj > 2u) { g2[r] += wg * y2[i]; u2[r] += wu * y2[i]; }
+                    if (nj > 3u) { g3[r] += wg * y3[i]; u3[r] += wu * y3[i]; }
+                }
+            }
+        }
+        for (uint r = 0; r < NR && row0 + r < args.out_rows; r++) {
+            float g = simd_sum(g0[r]), u = simd_sum(u0[r]);
+            if (tiisg == 0) mid[(uint64_t)p0 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
+            if (nj > 1u) {
+                g = simd_sum(g1[r]); u = simd_sum(u1[r]);
+                if (tiisg == 0) mid[(uint64_t)p1 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
+            }
+            if (nj > 2u) {
+                g = simd_sum(g2[r]); u = simd_sum(u2[r]);
+                if (tiisg == 0) mid[(uint64_t)p2 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
+            }
+            if (nj > 3u) {
+                g = simd_sum(g3[r]); u = simd_sum(u3[r]);
+                if (tiisg == 0) mid[(uint64_t)p3 * args.out_rows + row0 + r] = qwen4_silu(g) * u;
+            }
+        }
+    }
+}
+
+template [[host_name("kernel_qwen4_moe_mid_q4k_grouped")]]
+kernel void kernel_qwen4_moe_mid_q4k_grouped<2>(constant ds4_metal_args_qwen4_moe &,
+        device const char *, device const char *, device const int32_t *, device const float *,
+        device float *, device const int32_t *, device const int32_t *, uint3, ushort3, ushort, ushort);
+
 /* part[t][s][r] = down_row . mid[t][s]; slot n_slots is the shared expert */
 kernel void kernel_qwen4_moe_down(
         constant ds4_metal_args_qwen4_moe & args,
@@ -2816,7 +2936,7 @@ kernel void kernel_qwen4_moe_down(
  * order is spelled out with reassociation pinned off (tests/test_qwen4_kernels.c
  * pins the rows against kernel_qwen4_moe_down).  The shared Q8 slot keeps the
  * generic row dot. */
-#define QWEN4_MXFP4_PF_ACC(E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_) do { \
+#define QWEN4_MXFP4_PF_ACC_TO(ACC_, E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_) do { \
     const float d_ = ds4_metal_e8m0_to_f32(E_); \
     const float t0_ = ds4_metal_mxfp4_values[(Q0_) & 0xfu], t1_ = ds4_metal_mxfp4_values[(Q1_) & 0xfu]; \
     const float t2_ = ds4_metal_mxfp4_values[(Q0_) >> 4], t3_ = ds4_metal_mxfp4_values[(Q1_) >> 4]; \
@@ -2824,8 +2944,10 @@ kernel void kernel_qwen4_moe_down(
     /*ACC1*/ s_ = fma(t1_, (Y1_), s_);\
     /*ACC2*/ s_ = fma(t2_, (Y16_), s_);\
     /*ACC3*/ s_ = fma(t3_, (Y17_), s_);\
-    /*ACC4*/ acc = acc + s_ * d_;\
+    /*ACC4*/ (ACC_) = (ACC_) + s_ * d_;\
 } while (0)
+#define QWEN4_MXFP4_PF_ACC(E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_) \
+    QWEN4_MXFP4_PF_ACC_TO(acc, E_, Q0_, Q1_, Y0_, Y1_, Y16_, Y17_)
 
 kernel void kernel_qwen4_moe_down_mxfp4_pf(
         constant ds4_metal_args_qwen4_moe & args,
@@ -2895,6 +3017,103 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
         if (tiisg == 0) part[pair * args.out_rows + r] = v;
     }
 }
+
+/* kernel_qwen4_moe_down_mxfp4_pf over the batch's distinct experts, on the
+ * same list ownership as kernel_qwen4_moe_mid_q4k_grouped: the owning
+ * threadgroup walks each of its rows once per four pairs of the list, every
+ * pair with its own accumulator and the pinned chain order, so each pair's
+ * rows are the per-token kernel's bit for bit. */
+kernel void kernel_qwen4_moe_down_mxfp4_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const int32_t *lists,
+        device const int32_t *counts,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) part[(uint64_t)pair * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
+    const uint count = min((uint)counts[expert], args.list_cap);
+    if (count == 0 || (uint)list[0] != pair) return;
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint ix = tiisg / 8, it = tiisg % 8;
+    const uint nb = args.in_dim / 32;
+#define QWEN4_MXFP4_GROUPED_ROWS(ACC_, M_, IB_) do { \
+    device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
+    device const float *y1 = y0 + 128u, *y2 = y0 + 256u, *y3 = y0 + 384u; \
+    const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17]; \
+    const float y1a = y1[0], y1b = y1[1], y1c = y1[16], y1d = y1[17]; \
+    const float y2a = y2[0], y2b = y2[1], y2c = y2[16], y2d = y2[17]; \
+    const float y3a = y3[0], y3b = y3[1], y3c = y3[16], y3d = y3[17]; \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e0, p0, q0, y0a, y0b, y0c, y0d); \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e1, p1, q1, y1a, y1b, y1c, y1d); \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e2, p2, q2, y2a, y2b, y2c, y2d); \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e3, p3, q3, y3a, y3b, y3c, y3d); \
+} while (0)
+#define QWEN4_MXFP4_GROUPED_TAIL(ACC_, M_, IB_) do { \
+    device const float *y0 = (M_) + (IB_) * 32u + it * 2u; \
+    const float y0a = y0[0], y0b = y0[1], y0c = y0[16], y0d = y0[17]; \
+    QWEN4_MXFP4_PF_ACC_TO(ACC_, e0, p0, q0, y0a, y0b, y0c, y0d); \
+} while (0)
+    /* Up to four pairs per pass with named accumulators (see the mid kernel). */
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        const uint nj = min(4u, count - j0);
+        const uint pr0 = (uint)list[j0], pr1 = (uint)list[j0 + min(1u, nj - 1u)];
+        const uint pr2 = (uint)list[j0 + min(2u, nj - 1u)], pr3 = (uint)list[j0 + min(3u, nj - 1u)];
+        device const float *m0 = mid + (uint64_t)pr0 * args.in_dim, *m1 = mid + (uint64_t)pr1 * args.in_dim;
+        device const float *m2 = mid + (uint64_t)pr2 * args.in_dim, *m3 = mid + (uint64_t)pr3 * args.in_dim;
+        for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+            device const uchar *row = (device const uchar *)(down_base + ebase + (uint64_t)r * args.row_bytes);
+            float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+            uint ib = ix;
+            for (; ib + 12u < nb; ib += 16u) {
+                device const uchar *b0 = row + (uint64_t)ib * 17u;
+                device const uchar *b1 = b0 + 4u * 17u, *b2 = b0 + 8u * 17u, *b3 = b0 + 12u * 17u;
+                const uchar e0 = b0[0], e1 = b1[0], e2 = b2[0], e3 = b3[0];
+                const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
+                const uint p1 = b1[1 + it * 2u], q1 = b1[2 + it * 2u];
+                const uint p2 = b2[1 + it * 2u], q2 = b2[2 + it * 2u];
+                const uint p3 = b3[1 + it * 2u], q3 = b3[2 + it * 2u];
+                QWEN4_MXFP4_GROUPED_ROWS(acc0, m0, ib);
+                if (nj > 1u) QWEN4_MXFP4_GROUPED_ROWS(acc1, m1, ib);
+                if (nj > 2u) QWEN4_MXFP4_GROUPED_ROWS(acc2, m2, ib);
+                if (nj > 3u) QWEN4_MXFP4_GROUPED_ROWS(acc3, m3, ib);
+            }
+            for (; ib < nb; ib += 4u) {
+                device const uchar *b0 = row + (uint64_t)ib * 17u;
+                const uchar e0 = b0[0];
+                const uint p0 = b0[1 + it * 2u], q0 = b0[2 + it * 2u];
+                QWEN4_MXFP4_GROUPED_TAIL(acc0, m0, ib);
+                if (nj > 1u) QWEN4_MXFP4_GROUPED_TAIL(acc1, m1, ib);
+                if (nj > 2u) QWEN4_MXFP4_GROUPED_TAIL(acc2, m2, ib);
+                if (nj > 3u) QWEN4_MXFP4_GROUPED_TAIL(acc3, m3, ib);
+            }
+            float v = simd_sum(acc0);
+            if (tiisg == 0) part[(uint64_t)pr0 * args.out_rows + r] = v;
+            if (nj > 1u) { v = simd_sum(acc1); if (tiisg == 0) part[(uint64_t)pr1 * args.out_rows + r] = v; }
+            if (nj > 2u) { v = simd_sum(acc2); if (tiisg == 0) part[(uint64_t)pr2 * args.out_rows + r] = v; }
+            if (nj > 3u) { v = simd_sum(acc3); if (tiisg == 0) part[(uint64_t)pr3 * args.out_rows + r] = v; }
+        }
+    }
+}
+#undef QWEN4_MXFP4_GROUPED_ROWS
+#undef QWEN4_MXFP4_GROUPED_TAIL
 
 struct ds4_metal_args_qwen4_moe_reduce {
     uint32_t n_tokens;

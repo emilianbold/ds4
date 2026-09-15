@@ -3451,6 +3451,18 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+int ds4_gpu_qwen4_moe_mid_grouped_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t in_dim, uint32_t ff_dim);
+int ds4_gpu_qwen4_moe_down_grouped_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim);
 /* shared_gate NULL: no shared expert; shared NULL: the shared output is part
  * slot n_slots, otherwise `shared` [T][dim] holds it.  part_stride = slots per
  * token in part. */

@@ -58567,21 +58567,54 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
                 elapsed[4] * 1e3, elapsed[5] * 1e3, elapsed[6] * 1e3);
         return ok;
     }
-    if (ok) {
+    /* A decode batch runs the shared expert as dense projections over its
+     * rows, as the prefill path does: as a slot of the per-token kernels it
+     * is read once per row, 5 MB of Q8 per row and layer.  Single tokens and
+     * verify rows keep the slot.  DS4_QWEN4_MOE_SHARED_DENSE_MIN raises the
+     * width for A/B. */
+    const bool shared_dense = T > qwen4_env_threshold("DS4_QWEN4_MOE_SHARED_DENSE_MIN", 8u) &&
+        qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
+        qwen4_graph_dense_ok(l->ffn_down_shexp);
+    if (ok && shared_dense) {
+        ok = qwen4_gemv(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
+             qwen4_gemv(g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
+             ds4_gpu_swiglu_tensor(g->sh_mid, g->sh_gate, g->sh_up, T * DS4_N_FF_EXP, 0.0f, 1.0f) &&
+             qwen4_gemv(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, T);
+    }
+    /* Sixteen rows pick ten experts each but only a third as many distinct
+     * ones: the grouped kernels read every expert once per four rows that
+     * chose it instead of once per row, each row's arithmetic unchanged.
+     * DS4_QWEN4_MOE_NO_GROUP=1 keeps the per-row kernels for A/B. */
+    const bool grouped = shared_dense && l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_up_exps->type == DS4_TENSOR_Q4_K && l->ffn_down_exps->type == DS4_TENSOR_MXFP4 &&
+        getenv("DS4_QWEN4_MOE_NO_GROUP") == NULL;
+    if (ok && grouped) {
+        ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
+                                                  DS4_N_EXPERT, g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_mid_grouped_tensor(g->mid, g->mixed, g->selected, g->moe_lists, g->moe_counts,
+                                                  g->cap_tokens, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                                  l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
+                                                  DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP) &&
+             ds4_gpu_qwen4_moe_down_grouped_tensor(g->part, g->mid, g->selected, g->moe_lists, g->moe_counts,
+                                                   g->cap_tokens, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                                   l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED,
+                                                   DS4_N_FF_EXP, DS4_N_EMBD);
+    } else if (ok) {
         ok = ds4_gpu_qwen4_moe_mid_tensor(g->mid, g->mixed, g->selected, m->map, m->size, l->ffn_gate_exps->abs_offset,
                                           l->ffn_up_exps->abs_offset, l->ffn_gate_exps->type, DS4_N_EXPERT, T,
                                           DS4_N_EXPERT_USED, DS4_N_EMBD, DS4_N_FF_EXP,
-                                          l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
-                                          l->ffn_gate_shexp->type) != 0;
-    }
-    if (ok) {
-        ok = ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                          shared_dense ? 0u : l->ffn_gate_shexp->abs_offset,
+                                          shared_dense ? 0u : l->ffn_up_shexp->abs_offset,
+                                          shared_dense ? UINT32_MAX : l->ffn_gate_shexp->type) != 0 &&
+             ds4_gpu_qwen4_moe_down_tensor(g->part, g->mid, g->selected, m->map, m->size, l->ffn_down_exps->abs_offset,
                                            l->ffn_down_exps->type, DS4_N_EXPERT, T, DS4_N_EXPERT_USED, DS4_N_FF_EXP,
-                                           DS4_N_EMBD, l->ffn_down_shexp->abs_offset, l->ffn_down_shexp->type) != 0;
+                                           DS4_N_EMBD, shared_dense ? 0u : l->ffn_down_shexp->abs_offset,
+                                           shared_dense ? UINT32_MAX : l->ffn_down_shexp->type) != 0;
     }
     if (ok) {
-        ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit, NULL, g->R, g->inj, T,
-                                             DS4_N_EXPERT_USED, DS4_N_EXPERT_USED + 1u, DS4_N_EMBD, DS4_N_HC) != 0;
+        ok = ds4_gpu_qwen4_moe_reduce_tensor(g->blk, g->part, g->weights, g->sh_gate_logit,
+                                             shared_dense ? g->sh_out : NULL, g->R, g->inj, T, DS4_N_EXPERT_USED,
+                                             DS4_N_EXPERT_USED + (shared_dense ? 0u : 1u), DS4_N_EMBD, DS4_N_HC) != 0;
     }
     return ok;
 }
