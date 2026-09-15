@@ -445,8 +445,16 @@ static bool verify_spec_matches_plain(const bench_env *env,
             const int token = ds4_session_argmax_excluding(reference[i], env->eos);
             const int want = seq[(size_t)i * cycles * SPEC_MAX_TOKENS + k];
             if (token != want) {
-                fprintf(stderr, BENCH ": spec verify failed: stream %d token %d: speculative %d, plain %d\n",
-                        i, k, want, token);
+                /* the reference's margin tells a reduction-order near-tie
+                 * from a real numeric divergence */
+                float *row = malloc((size_t)env->vocab * sizeof(*row));
+                double gap = 0.0;
+                if (row && ds4_session_copy_logits(reference[i], row, env->vocab) == env->vocab &&
+                    want >= 0 && want < env->vocab)
+                    gap = (double)row[token] - (double)row[want];
+                free(row);
+                fprintf(stderr, BENCH ": spec verify failed: stream %d token %d: speculative %d, plain %d "
+                        "(plain logit margin %.3g)\n", i, k, want, token, gap);
                 ok = false;
                 break;
             }

@@ -58227,7 +58227,11 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
  * scores the draft over that leading prefix of the output head only.  The
  * verify rows always use the full head, so committed tokens and every
  * teacher-forced logit are unchanged; only which draft is proposed can differ
- * when the true argmax lies beyond the prefix.  Default: the full vocabulary. */
+ * when the true argmax lies beyond the prefix.  Default: the full vocabulary
+ * (65536 rows read 168 MB per draft instead of 636 and gained 2-4% on code
+ * and 1% on prose over 48 tokens, but lost 3% on both over 200: the
+ * acceptance it forfeits depends on the text; a frequency-ordered list would
+ * not). */
 /* DS4_QWEN4_MTP_DRAFT_VOCAB=<file>: token ids, one per line, most frequent
  * first (the MTPLX FR-Spec idea).  The draft head becomes a gathered copy of
  * those output rows, so the draft is scored over that subset and the argmax
@@ -78923,12 +78927,13 @@ static bool qwen4_batch_mtp_drafts(qwen4_batch_member *mem, int count, const uin
                                     (uint32_t)count);
     g->R = R_save;
     g->mixed = mixed_save;
-    if (ok) ok = qwen4_gemv(g->batch_logits, m, w->output, g->batch_head_x, (uint32_t)count);
+    const uint32_t head_rows = qwen4_mtp_draft_rows();
+    if (ok) ok = qwen4_gemv_rows(g->batch_logits, m, w->output, g->batch_head_x, (uint32_t)count, head_rows);
     for (int i = 0; ok && i < count; i++) {
         ds4_qwen4_gpu_graph *sg = &mem[i].session->qwen4_graph;
-        ds4_gpu_tensor *row = ds4_gpu_tensor_view(g->batch_logits, (uint64_t)i * DS4_N_VOCAB * sizeof(float),
-                                                  (uint64_t)DS4_N_VOCAB * sizeof(float));
-        ok = row && ds4_gpu_qwen4_argmax_tensor(sg->mtp_argmax, sg->mtp_argmax_tmp, row, DS4_N_VOCAB, NULL) != 0;
+        ds4_gpu_tensor *row = ds4_gpu_tensor_view(g->batch_logits, (uint64_t)i * head_rows * sizeof(float),
+                                                  (uint64_t)head_rows * sizeof(float));
+        ok = row && ds4_gpu_qwen4_argmax_tensor(sg->mtp_argmax, sg->mtp_argmax_tmp, row, head_rows, NULL) != 0;
         ds4_gpu_tensor_free(row);
     }
     if (!ds4_gpu_end_commands()) ok = false;
