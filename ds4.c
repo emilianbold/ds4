@@ -58150,7 +58150,9 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
      * they would otherwise reach stages the activations as halves, and the
      * hyper-connection up projections carried that rounding into the
      * logits.  The tile costs the same and keeps float operands. */
-    const bool f16_batch = !legacy && n_tok > 1u && w->type == DS4_TENSOR_F16 &&
+    /* Verify rows (two or three tokens) stay on the few-row matvec: the
+     * tile costs them three times more, and it is their original path. */
+    const bool f16_batch = !legacy && n_tok > 3u && w->type == DS4_TENSOR_F16 &&
         (out_dim <= qwen4_env_threshold("DS4_QWEN4_DENSE_MM_NARROW_ROWS", 512u) ||
          (n_tok > 8u && n_tok <= qwen4_env_threshold("DS4_QWEN4_DENSE_MM_F16_MAX", 64u)));
     if (((n_tok > mm_min && w->type == DS4_TENSOR_F32) || f16_batch) &&
