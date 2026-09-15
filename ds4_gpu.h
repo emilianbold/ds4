@@ -289,6 +289,25 @@ typedef struct {
     int use_sel;
 } ds4_gpu_qwen4_attn_row;
 #define DS4_GPU_QWEN4_ATTN_ROW_BYTES 64u   /* one staged table entry */
+/* One session of a decode batch for the GDN rows kernels: its state and
+ * history, optional snapshots of both after its first token, its first row
+ * and its row count (one or two). */
+typedef struct {
+    ds4_gpu_tensor *state, *hist, *snap_state, *snap_hist;
+    uint32_t row0, n_tok;
+} ds4_gpu_qwen4_gdn_row;
+#define DS4_GPU_QWEN4_GDN_ROW_BYTES 48u
+int ds4_gpu_qwen4_gdn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
+                                 const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows);
+int ds4_gpu_qwen4_gdn_scan_rows2_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t qkv_stride, uint32_t out_stride);
+int ds4_gpu_qwen4_conv_stream_rows2_tensor(
+        ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const ds4_gpu_tensor *table, uint64_t entry0, const ds4_gpu_qwen4_gdn_row *rows, uint32_t n_rows,
+        uint32_t n_batch_rows, uint32_t n_channels, uint32_t conv_kernel, uint32_t x_stride, int apply_silu);
 int ds4_gpu_qwen4_attn_rows_stage(ds4_gpu_tensor *table, uint64_t entry0,
                                   const ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows, uint32_t ratio);
 int ds4_gpu_qwen4_attn_prep_rows_tensor(

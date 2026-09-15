@@ -546,6 +546,61 @@ kernel void kernel_qwen4_conv_stream_rows(
     for (uint t = 0; t + 1 < K; t++) st[t * C + c] = win[t];
 }
 
+/* One entry per session of a batch for the *_rows2 kernels: its recurrent
+ * state and convolution history by GPU address (the caches stay private,
+ * so a session's snapshot can keep swapping places with its state), its
+ * first batch row and how many consecutive rows it owns (its token, then
+ * its draft).  A non-zero snapshot address receives the state after the
+ * first token, as the verify kernels write it. */
+struct ds4_metal_qwen4_gdn_row {
+    uint64_t state;
+    uint64_t hist;
+    uint64_t snap_state;
+    uint64_t snap_hist;
+    uint32_t row0;
+    uint32_t n_tok;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
+/* kernel_qwen4_conv_stream_rows over the table: one or two tokens in order
+ * per entry against its own history, the window after the first token
+ * written to the entry's snapshot when it has one. */
+kernel void kernel_qwen4_conv_stream_rows2(
+        constant ds4_metal_args_qwen4_conv_stream_rows & args,
+        device float       *x,
+        device const float *weight,
+        device const ds4_metal_qwen4_gdn_row *rows,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint c = tgpig.x * ntg.x + tid;
+    const uint r = tgpig.y;
+    if (c >= args.n_channels || r >= args.n_rows) return;
+    const ds4_metal_qwen4_gdn_row e = rows[r];
+    const uint C = args.n_channels;
+    const uint K = args.conv_kernel;
+    device float *st = reinterpret_cast<device float *>(e.hist);
+    float win[3];
+    for (uint t = 0; t + 1 < K; t++) win[t] = st[t * C + c];
+    float taps[4];
+    for (uint t = 0; t < K; t++) taps[t] = weight[c * K + t];
+    for (uint tok = 0; tok < e.n_tok; tok++) {
+        device float *xr = x + (uint64_t)(e.row0 + tok) * args.x_stride;
+        const float raw = xr[c];
+        float acc = taps[K - 1] * raw;
+        for (uint t = 0; t + 1 < K; t++) acc += taps[t] * win[t];
+        for (uint t = 0; t + 2 < K; t++) win[t] = win[t + 1];
+        win[K - 2] = raw;
+        xr[c] = args.apply_silu ? qwen4_silu(acc) : acc;
+        if (tok == 0 && e.snap_hist) {
+            device float *sh = reinterpret_cast<device float *>(e.snap_hist);
+            for (uint t = 0; t + 1 < K; t++) sh[t * C + c] = win[t];
+        }
+    }
+    for (uint t = 0; t + 1 < K; t++) st[t * C + c] = win[t];
+}
+
 #define QWEN4_CONV_BLOCK 64u
 /* Only incoming block windows need a snapshot; raw rows inside each block
  * stay private to its channel thread until they have entered the window. */
@@ -767,6 +822,56 @@ kernel void kernel_qwen4_gdn_scan_rows(
             float4(o[0], o[1], o[2], o[3]);
     }
     for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
+}
+
+/* kernel_qwen4_gdn_scan_rows over the table: the per-token arithmetic of
+ * kernel_qwen4_gdn_scan_r4, one or two tokens in order per entry, the
+ * state after the first written to the entry's snapshot when it has one. */
+kernel void kernel_qwen4_gdn_scan_rows2(
+        constant ds4_metal_args_qwen4_gdn_scan_rows & args,
+        device const float *qkv,
+        device const float *ga,
+        device const float *gb,
+        device float       *out,
+        device const ds4_metal_qwen4_gdn_row *rows,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint dv0 = (tgpig.x * (ntg.x / 32) + sgitg) * 4;
+    const uint h = tgpig.y;
+    const uint r = tgpig.z;
+    if (dv0 >= args.head_dim || h >= args.n_v_head || r >= args.n_rows) return;
+    const ds4_metal_qwen4_gdn_row e = rows[r];
+    const uint D = 128, dk0 = tiisg * 4;
+    const uint kh = h % args.n_k_head;
+    const uint64_t at = ((uint64_t)h * D + dv0) * D + dk0;
+    device float *srow = reinterpret_cast<device float *>(e.state) + at;
+    float4 s[4];
+    for (uint i = 0; i < 4; i++) s[i] = *(device const float4 *)(srow + i * D);
+    for (uint tok = 0; tok < e.n_tok; tok++) {
+        const uint row = e.row0 + tok;
+        device const float *base = qkv + (uint64_t)row * args.qkv_stride;
+        const float4 q = *(device const float4 *)(base + kh * D + dk0);
+        const float4 k = *(device const float4 *)(base + (args.n_k_head + kh) * D + dk0);
+        const float4 v = *(device const float4 *)(base + 2 * args.n_k_head * D + h * D + dv0);
+        const float g = ga[(uint64_t)row * args.n_v_head + h];
+        const float beta = gb[(uint64_t)row * args.n_v_head + h];
+        float u[4], o[4];
+        for (uint i = 0; i < 4; i++) { s[i] *= g; u[i] = dot(s[i], k); }
+        for (uint i = 0; i < 4; i++) u[i] = simd_sum(u[i]);
+        for (uint i = 0; i < 4; i++) { s[i] += k * ((v[i] - u[i]) * beta); o[i] = dot(s[i], q); }
+        for (uint i = 0; i < 4; i++) o[i] = simd_sum(o[i]);
+        if (tiisg == 0) {
+            *(device float4 *)(out + (uint64_t)row * args.out_stride + (uint64_t)h * D + dv0) =
+                float4(o[0], o[1], o[2], o[3]);
+        }
+        if (tok == 0 && e.snap_state) {
+            device float *snaprow = reinterpret_cast<device float *>(e.snap_state) + at;
+            for (uint i = 0; i < 4; i++) *(device float4 *)(snaprow + i * D) = s[i];
+        }
+    }
+    for (uint i = 0; i < 4; i++) *(device float4 *)(srow + i * D) = s[i];
 }
 
 kernel void kernel_qwen4_gdn_scan_r4(

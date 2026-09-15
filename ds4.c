@@ -57564,7 +57564,7 @@ typedef struct ds4_qwen4_gpu_graph {
     /* Arena only, grown on demand: one logit row per batch member, the
      * attention rows' cache table (one entry per row and layer) and their
      * split partials. */
-    ds4_gpu_tensor *batch_logits, *batch_attn_rows, *batch_attn_part, *batch_head_x;
+    ds4_gpu_tensor *batch_logits, *batch_attn_rows, *batch_attn_part, *batch_head_x, *batch_gdn_rows;
     uint32_t batch_logit_rows;
     ds4_gpu_tensor *layer_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_lin_hist[DS4_MAX_LAYER];
@@ -57736,7 +57736,8 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->batch_attn_rows);
         ds4_gpu_tensor_free(g->batch_attn_part);
         ds4_gpu_tensor_free(g->batch_head_x);
-        g->batch_logits = g->batch_attn_rows = g->batch_attn_part = g->batch_head_x = NULL;
+        ds4_gpu_tensor_free(g->batch_gdn_rows);
+        g->batch_logits = g->batch_attn_rows = g->batch_attn_part = g->batch_head_x = g->batch_gdn_rows = NULL;
         g->batch_logit_rows = 0;
         free(g->host_row);
     }
@@ -78275,14 +78276,17 @@ static bool qwen4_batch_scratch_ensure(ds4_qwen4_gpu_graph *g, uint32_t rows) {
     ds4_gpu_tensor_free(g->batch_attn_rows);
     ds4_gpu_tensor_free(g->batch_attn_part);
     ds4_gpu_tensor_free(g->batch_head_x);
+    ds4_gpu_tensor_free(g->batch_gdn_rows);
     g->batch_logit_rows = 0;
+    g->batch_gdn_rows = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * QWEN4_BATCH_MAX_ROWS * DS4_GPU_QWEN4_GDN_ROW_BYTES);
     g->batch_logits = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_VOCAB * sizeof(float));
     g->batch_head_x = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_EMBD * sizeof(float));
     g->batch_attn_rows = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * QWEN4_BATCH_MAX_ROWS *
                                               DS4_GPU_QWEN4_ATTN_ROW_BYTES);
     g->batch_attn_part = ds4_gpu_tensor_alloc(ds4_gpu_qwen4_attn_part_floats(rows, DS4_N_HEAD, DS4_N_HEAD_DIM) *
                                               sizeof(float));
-    if (!g->batch_logits || !g->batch_attn_rows || !g->batch_attn_part || !g->batch_head_x) return false;
+    if (!g->batch_logits || !g->batch_attn_rows || !g->batch_attn_part || !g->batch_head_x ||
+        !g->batch_gdn_rows) return false;
     g->batch_logit_rows = rows;
     return true;
 }
@@ -78417,32 +78421,24 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
  * through a staged table, keeping the single-row arithmetic (the row's split
  * count included), so the outputs are those of the per-row dispatches.
  * DS4_QWEN4_NO_BATCH_ATTN takes the per-row path for A/B. */
-static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
-                                       ds4_qwen4_gpu_graph *g, const ds4_model *m,
-                                       const ds4_layer_weights *l, uint32_t il) {
+/* The rows kernels over explicit entries, one per token of the batch in row
+ * order: a session with a draft row has two entries, its caches at pos and
+ * pos + 1, so the second token sees the first's keys the way a two-row
+ * verify does. */
+static bool qwen4_batch_attention_entries(ds4_gpu_qwen4_attn_row *rows, uint32_t n_rows,
+                                          ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                          const ds4_layer_weights *l, uint32_t il) {
     const uint32_t ratio = 4u;
-    const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    ds4_gpu_qwen4_attn_row rows[QWEN4_BATCH_MAX_ROWS];
     uint32_t n_block_stride = 0;
     bool any_sparse = false, any_block = false;
-    for (int i = 0; i < count; i++) {
-        const ds4_qwen4_gpu_graph *r = &rowg[i];
-        rows[i].k_cache = r->layer_k_cache[il];
-        rows[i].v_cache = r->layer_v_cache[il];
-        rows[i].ik_cache = r->layer_ik_cache[il];
-        rows[i].block_key = r->layer_block_key[il];
-        rows[i].pos3 = r->pos3;
-        rows[i].pos = r->pos;
-        rows[i].use_sel = r->pos >= sparse_pos;
-        if (r->pos >= r->ctx_cap) return false;
-        const uint32_t n_blocks = (r->pos + 1u) / ratio;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const uint32_t n_blocks = (rows[i].pos + 1u) / ratio;
         if (n_blocks > n_block_stride) n_block_stride = n_blocks;
         any_sparse |= rows[i].use_sel != 0;
-        any_block |= (r->pos + 1u) % ratio == 0u;
+        any_block |= (rows[i].pos + 1u) % ratio == 0u;
     }
     const uint64_t entry0 = (uint64_t)il * QWEN4_BATCH_MAX_ROWS;
-    const uint32_t n_rows = (uint32_t)count;
     bool ok = ds4_gpu_qwen4_attn_rows_stage(g->batch_attn_rows, entry0, rows, n_rows, ratio) &&
               ds4_gpu_qwen4_attn_prep_rows_tensor(g->q, g->gate, g->iqn, g->qg, g->kp, g->vp, g->iq, g->ik,
                                                   g->batch_attn_rows, entry0, rows, n_rows, m->map, m->size,
@@ -78469,6 +78465,25 @@ static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
                                                        g->batch_attn_part, g->batch_attn_rows, entry0, rows,
                                                        n_rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
                                                        g->sel_stride, scale);
+}
+
+static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
+                                       ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t il) {
+    const uint32_t sparse_pos = (g->k_blocks + 1u) * 4u - 1u;
+    ds4_gpu_qwen4_attn_row rows[QWEN4_BATCH_MAX_ROWS];
+    for (int i = 0; i < count; i++) {
+        const ds4_qwen4_gpu_graph *r = &rowg[i];
+        rows[i].k_cache = r->layer_k_cache[il];
+        rows[i].v_cache = r->layer_v_cache[il];
+        rows[i].ik_cache = r->layer_ik_cache[il];
+        rows[i].block_key = r->layer_block_key[il];
+        rows[i].pos3 = r->pos3;
+        rows[i].pos = r->pos;
+        rows[i].use_sel = r->pos >= sparse_pos;
+        if (r->pos >= r->ctx_cap) return false;
+    }
+    return qwen4_batch_attention_entries(rows, (uint32_t)count, g, m, l, il);
 }
 
 static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
@@ -78758,27 +78773,38 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up,
                                         l->hc_attn_inject, T);
         if (ok && ds4_qwen4_layer_is_linear(il)) {
+            /* projections over every row; the convolution and the scan walk
+             * each session's one or two rows against its own state through
+             * the row table, snapshotting after the first as the verify does */
             ok = qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T) &&
-                 qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T);
-            /* the fused front (gates, convolution, prep) and the scan are the
-             * single-session verify kernels, snapshots included */
-            for (int i = 0; ok && i < count; i++) {
-                ok = ds4_gpu_qwen4_gdn_front_tensor(views[i].qkv, rowg[i].layer_lin_hist[il], views[i].mixed,
-                                                    views[i].ga, views[i].gb, m->map, m->size,
-                                                    l->lin_conv->abs_offset, l->lin_alpha->abs_offset,
-                                                    l->lin_beta->abs_offset, l->lin_a->abs_offset,
-                                                    l->lin_dt_bias->abs_offset, l->lin_alpha->type, mem[i].n,
-                                                    DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
-                                                    DS4_N_LIN_CONV, DS4_N_EMBD,
-                                                    rowg[i].snap_after_first ? rowg[i].snap_lin_hist[il] : NULL, 0u,
-                                                    NULL, 1u) != 0 &&
-                     ds4_gpu_qwen4_gdn_scan_tensor(views[i].lin_o, rowg[i].layer_lin_state[il], views[i].qkv,
-                                                   views[i].ga, views[i].gb, mem[i].n, DS4_N_LIN_K_HEAD,
-                                                   DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
-                                                   rowg[i].snap_after_first ? rowg[i].snap_lin_state[il] : NULL, 0u,
-                                                   NULL, 1u) != 0;
+                 qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T) &&
+                 qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
+                 qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T);
+            ds4_gpu_qwen4_gdn_row grows[QWEN4_BATCH_MAX_ROWS];
+            for (int i = 0; i < count; i++) {
+                const bool snap = rowg[i].snap_after_first && rowg[i].snap_lin_state[il] && mem[i].n == 2u;
+                grows[i].state = rowg[i].layer_lin_state[il];
+                grows[i].hist = rowg[i].layer_lin_hist[il];
+                grows[i].snap_state = snap ? rowg[i].snap_lin_state[il] : NULL;
+                grows[i].snap_hist = snap ? rowg[i].snap_lin_hist[il] : NULL;
+                grows[i].row0 = mem[i].row0;
+                grows[i].n_tok = mem[i].n;
             }
-            if (ok) ok = ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
+            const uint64_t entry0 = (uint64_t)il * QWEN4_BATCH_MAX_ROWS;
+            const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+            if (ok) ok = ds4_gpu_qwen4_gdn_rows_stage(g->batch_gdn_rows, entry0, grows, (uint32_t)count) &&
+                         ds4_gpu_qwen4_conv_stream_rows2_tensor(g->qkv, m->map, m->size, l->lin_conv->abs_offset,
+                                                                g->batch_gdn_rows, entry0, grows, (uint32_t)count, T,
+                                                                DS4_N_LIN_CONV_DIM, DS4_N_LIN_CONV, DS4_N_LIN_CONV_DIM,
+                                                                1) &&
+                         ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size, l->lin_a->abs_offset,
+                                                       l->lin_dt_bias->abs_offset, T, DS4_N_LIN_K_HEAD,
+                                                       DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM) &&
+                         ds4_gpu_qwen4_gdn_scan_rows2_tensor(g->lin_o, g->qkv, g->ga, g->gb, g->batch_gdn_rows, entry0,
+                                                             grows, (uint32_t)count, T, DS4_N_LIN_K_HEAD,
+                                                             DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV_DIM,
+                                                             (uint32_t)v_dim) &&
+                         ds4_gpu_qwen4_gdn_out_tensor(g->lin_o, g->z, m->map, m->size, l->lin_norm->abs_offset, T,
                                                       DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0 &&
                          qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
         } else if (ok) {
@@ -78787,10 +78813,25 @@ static bool qwen4_graph_encode_native_session_batch_ragged(const qwen4_batch_mem
                  qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
                  qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
                  qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+            /* one entry per token: a draft row's entry sits at pos + 1 */
+            ds4_gpu_qwen4_attn_row arows[2 * QWEN4_BATCH_MAX_ROWS];
+            const uint32_t sparse_pos = (g->k_blocks + 1u) * 4u - 1u;
             for (int i = 0; ok && i < count; i++) {
-                ok = qwen4_graph_attention_tail(&rowg[i], m, l, il, rowg[i].pos, mem[i].n);
+                const ds4_qwen4_gpu_graph *r = &rowg[i];
+                for (uint32_t t = 0; t < mem[i].n; t++) {
+                    ds4_gpu_qwen4_attn_row *e = &arows[mem[i].row0 + t];
+                    e->k_cache = r->layer_k_cache[il];
+                    e->v_cache = r->layer_v_cache[il];
+                    e->ik_cache = r->layer_ik_cache[il];
+                    e->block_key = r->layer_block_key[il];
+                    e->pos3 = r->pos3;
+                    e->pos = r->pos + t;
+                    e->use_sel = e->pos >= sparse_pos;
+                    if (e->pos >= r->ctx_cap) ok = false;
+                }
             }
-            if (ok) ok = qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+            if (ok) ok = qwen4_batch_attention_entries(arows, T, g, m, l, il) &&
+                         qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
         }
         if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, DS4_N_EMBD, DS4_N_HC) != 0;
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
