@@ -57561,8 +57561,10 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
     ds4_gpu_tensor *moe_lists, *moe_counts, *sh_gate, *sh_up, *sh_mid, *sh_out, *hc_u, *hc_lo_act;
     ds4_gpu_tensor *logits;
-    /* Arena only: one logit row per batch member, grown on demand. */
-    ds4_gpu_tensor *batch_logits;
+    /* Arena only, grown on demand: one logit row per batch member, the
+     * attention rows' cache table (one entry per row and layer) and their
+     * split partials. */
+    ds4_gpu_tensor *batch_logits, *batch_attn_rows, *batch_attn_part;
     uint32_t batch_logit_rows;
     ds4_gpu_tensor *layer_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_lin_hist[DS4_MAX_LAYER];
@@ -57731,7 +57733,9 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
             *scratch[i] = NULL;
         }
         ds4_gpu_tensor_free(g->batch_logits);
-        g->batch_logits = NULL;
+        ds4_gpu_tensor_free(g->batch_attn_rows);
+        ds4_gpu_tensor_free(g->batch_attn_part);
+        g->batch_logits = g->batch_attn_rows = g->batch_attn_part = NULL;
         g->batch_logit_rows = 0;
         free(g->host_row);
     }
@@ -78186,12 +78190,18 @@ static void qwen4_batch_row_graph(ds4_qwen4_gpu_graph *out, ds4_session *s,
     out->attn_o = v->attn_o;
 }
 
-static bool qwen4_batch_logits_ensure(ds4_qwen4_gpu_graph *g, uint32_t rows) {
+static bool qwen4_batch_scratch_ensure(ds4_qwen4_gpu_graph *g, uint32_t rows) {
     if (g->batch_logits && g->batch_logit_rows >= rows) return true;
     ds4_gpu_tensor_free(g->batch_logits);
+    ds4_gpu_tensor_free(g->batch_attn_rows);
+    ds4_gpu_tensor_free(g->batch_attn_part);
     g->batch_logit_rows = 0;
     g->batch_logits = ds4_gpu_tensor_alloc((uint64_t)rows * DS4_N_VOCAB * sizeof(float));
-    if (!g->batch_logits) return false;
+    g->batch_attn_rows = ds4_gpu_tensor_alloc((uint64_t)DS4_N_LAYER * QWEN4_BATCH_MAX_ROWS *
+                                              DS4_GPU_QWEN4_ATTN_ROW_BYTES);
+    g->batch_attn_part = ds4_gpu_tensor_alloc(ds4_gpu_qwen4_attn_part_floats(rows, DS4_N_HEAD, DS4_N_HEAD_DIM) *
+                                              sizeof(float));
+    if (!g->batch_logits || !g->batch_attn_rows || !g->batch_attn_part) return false;
     g->batch_logit_rows = rows;
     return true;
 }
@@ -78319,6 +78329,67 @@ static bool qwen4_batch_linear(ds4_decode_item *items, int count,
            qwen4_gemv(g->blk, m, l->lin_out, g->lin_o, T);
 }
 
+/* Every row's attention in one dispatch per stage: the projections above
+ * are batched already, and the per-row kernels below are tiny grids that run
+ * one after another, so sixteen rows cost sixteen latencies each.  The rows
+ * kernels take the row as a grid axis and reach each session's caches
+ * through a staged table, keeping the single-row arithmetic (the row's split
+ * count included), so the outputs are those of the per-row dispatches.
+ * DS4_QWEN4_NO_BATCH_ATTN takes the per-row path for A/B. */
+static bool qwen4_batch_attention_rows(int count, ds4_qwen4_gpu_graph *rowg,
+                                       ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t il) {
+    const uint32_t ratio = 4u;
+    const uint32_t sparse_pos = (g->k_blocks + 1u) * ratio - 1u;
+    const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    ds4_gpu_qwen4_attn_row rows[QWEN4_BATCH_MAX_ROWS];
+    uint32_t n_block_stride = 0;
+    bool any_sparse = false, any_block = false;
+    for (int i = 0; i < count; i++) {
+        const ds4_qwen4_gpu_graph *r = &rowg[i];
+        rows[i].k_cache = r->layer_k_cache[il];
+        rows[i].v_cache = r->layer_v_cache[il];
+        rows[i].ik_cache = r->layer_ik_cache[il];
+        rows[i].block_key = r->layer_block_key[il];
+        rows[i].pos3 = r->pos3;
+        rows[i].pos = r->pos;
+        rows[i].use_sel = r->pos >= sparse_pos;
+        if (r->pos >= r->ctx_cap) return false;
+        const uint32_t n_blocks = (r->pos + 1u) / ratio;
+        if (n_blocks > n_block_stride) n_block_stride = n_blocks;
+        any_sparse |= rows[i].use_sel != 0;
+        any_block |= (r->pos + 1u) % ratio == 0u;
+    }
+    const uint64_t entry0 = (uint64_t)il * QWEN4_BATCH_MAX_ROWS;
+    const uint32_t n_rows = (uint32_t)count;
+    bool ok = ds4_gpu_qwen4_attn_rows_stage(g->batch_attn_rows, entry0, rows, n_rows, ratio) &&
+              ds4_gpu_qwen4_attn_prep_rows_tensor(g->q, g->gate, g->iqn, g->qg, g->kp, g->vp, g->iq, g->ik,
+                                                  g->batch_attn_rows, entry0, rows, n_rows, m->map, m->size,
+                                                  l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
+                                                  l->indexer_q_norm->abs_offset, DS4_N_HEAD, DS4_N_HEAD_KV,
+                                                  DS4_N_HEAD_DIM, DS4_N_ROT, DS4_N_INDEXER_HEAD,
+                                                  DS4_N_INDEXER_HEAD_DIM, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+    if (ok && any_block) {
+        ok = ds4_gpu_qwen4_idx_block_key_rows_tensor(g->batch_attn_rows, entry0, rows, n_rows, m->map, m->size,
+                                                     l->indexer_k_norm->abs_offset, ratio,
+                                                     DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
+                                                     DS4_RMS_EPS);
+    }
+    if (ok && any_sparse) {
+        ok = ds4_gpu_qwen4_idx_score_rows_tensor(g->score, g->tile_max, g->iqn, g->batch_attn_rows, entry0,
+                                                 rows, n_rows, n_block_stride, DS4_N_INDEXER_HEAD,
+                                                 DS4_N_INDEXER_HEAD_DIM, ratio) &&
+             ds4_gpu_qwen4_idx_select_rows_tensor(g->sel_blocks, g->score, g->tile_max, g->batch_attn_rows,
+                                                  entry0, rows, n_rows, n_block_stride, g->k_blocks) &&
+             ds4_gpu_qwen4_idx_expand_rows_tensor(g->sel_tokens, g->n_sel, g->sel_blocks, g->batch_attn_rows,
+                                                  entry0, n_rows, g->k_blocks, ratio, g->sel_stride);
+    }
+    return ok && ds4_gpu_qwen4_attn_decode_rows_tensor(g->attn_o, g->q, g->gate, g->sel_tokens, g->n_sel,
+                                                       g->batch_attn_part, g->batch_attn_rows, entry0, rows,
+                                                       n_rows, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                                       g->sel_stride, scale);
+}
+
 static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
                                   ds4_qwen4_gpu_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il, uint32_t T) {
@@ -78328,6 +78399,14 @@ static bool qwen4_batch_attention(int count, ds4_qwen4_gpu_graph *rowg,
               qwen4_gemv(g->vp, m, l->attn_v, g->mixed, T) &&
               qwen4_gemv(g->iq, m, l->indexer_q_proj, g->mixed, T) &&
               qwen4_gemv(g->ik, m, l->indexer_k_proj, g->mixed, T);
+    static int rows_path = -1;
+    if (rows_path < 0) {
+        rows_path = getenv("DS4_QWEN4_NO_BATCH_ATTN") == NULL &&
+                    getenv("DS4_QWEN4_NO_IDX_SELECT") == NULL &&
+                    (DS4_N_HEAD_DIM == 128u || DS4_N_HEAD_DIM == 256u);
+    }
+    if (ok && rows_path) return qwen4_batch_attention_rows(count, rowg, g, m, l, il) &&
+                                qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
     /* Each row appends to its own KV and indexer caches at its own position,
      * then reads them back through its own block selection. */
     for (int i = 0; ok && i < count; i++) {
@@ -78371,7 +78450,7 @@ static bool qwen4_graph_encode_native_session_batch(ds4_decode_item *items, int 
     for (int i = 0; ok && i < count; i++) {
         qwen4_batch_row_graph(&rowg[i], items[i].session, &views[i]);
     }
-    if (ok) ok = qwen4_batch_logits_ensure(g, T);
+    if (ok) ok = qwen4_batch_scratch_ensure(g, T);
 
     /* DS4_QWEN4_BATCH_TIMING=1 synchronizes after each stage group and reports
      * GPU ms per group.  The synchronization is itself expensive, so the split
