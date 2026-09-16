@@ -79895,7 +79895,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
  * (1 + p) c_plain > c_spec, with p the drafts' acceptance and the two
  * cycle times measured on this engine (a plain cycle 80 ms, a speculative
  * one 149 ms at sixteen streams: code at p = 0.94 gains, prose at 0.62
- * loses).  The engine starts by drafting for sixteen cycles and running
+ * loses).  The engine starts by drafting for eight cycles and running
  * two plain ones, which prices both kinds; from then on the other kind gets
  * a two-cycle probe, every thirty-two cycles while plain (the text may turn
  * predictable) and every hundred and twenty-eight while speculating (only
@@ -79905,7 +79905,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 static bool qwen4_batch_spec_next(const ds4_engine *e) {
     const uint32_t cycle = e->qwen4_batch_cycles;
     const float p = e->qwen4_batch_p, cp = e->qwen4_batch_ms[0], cs = e->qwen4_batch_ms[1];
-    if (cp <= 0.0f || cs <= 0.0f) return cycle % 32u < 16u;
+    if (cp <= 0.0f || cs <= 0.0f) return cycle % 32u < 8u;
     return (1.0f + p) * cp > cs ? cycle % 128u >= 2u : cycle % 32u < 2u;
 }
 #endif
