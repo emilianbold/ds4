@@ -42294,6 +42294,7 @@ struct ds4_engine {
     /* Qwen keeps the same idea in its own graph shape; the first session
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
+    uint32_t qwen4_arena_users;   /* live sessions borrowing the shared workspace */
     /* batched speculative policy: the drafts' measured acceptance and the
      * wall time of a plain and of a speculative batched cycle */
     float qwen4_batch_p, qwen4_batch_ms[2];
@@ -72931,14 +72932,21 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             e->prefill_chunk : qwen4_prefill_chunk_tokens((uint32_t)ctx_size);
         /* Every slot of a batched server has the same shape, so one arena of
          * transients serves them all and each extra session then costs only
-         * its own caches.  A session that would need a wider arena keeps
-         * private transients instead of growing the shared one. */
+         * its own caches.  A session that needs a wider arena replaces it
+         * when no live session borrows it (a new context size once the
+         * previous sessions closed) and keeps private transients otherwise. */
         const uint32_t block_cap = (uint32_t)ctx_size / 4u + 1u;
-        const ds4_qwen4_gpu_graph *shared =
-            e->share_session_prefill_workspace && e->qwen4_shared_workspace &&
+        const bool arena_fits = e->qwen4_shared_workspace &&
             e->qwen4_shared_workspace->cap_tokens >= cap_tokens &&
-            e->qwen4_shared_workspace->n_block_cap >= block_cap
-                ? e->qwen4_shared_workspace : NULL;
+            e->qwen4_shared_workspace->n_block_cap >= block_cap;
+        if (e->share_session_prefill_workspace && e->qwen4_shared_workspace && !arena_fits &&
+            e->qwen4_arena_users == 0) {
+            qwen4_graph_free(e->qwen4_shared_workspace);
+            free(e->qwen4_shared_workspace);
+            e->qwen4_shared_workspace = NULL;
+        }
+        const ds4_qwen4_gpu_graph *shared =
+            e->share_session_prefill_workspace && arena_fits ? e->qwen4_shared_workspace : NULL;
         s->qwen4_slot = -1;
         if (e->share_session_prefill_workspace && !e->glm_mtp &&
             getenv("DS4_QWEN4_NO_STATE_POOL") == NULL &&
@@ -72975,6 +72983,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         s->qwen4_graph_ready = true;
+        if (!s->qwen4_graph.owns_scratch) e->qwen4_arena_users++;
         s->prefill_cap = (uint32_t)ctx_size;
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
@@ -73339,6 +73348,7 @@ void ds4_session_free(ds4_session *s) {
             if (s->qwen4_slot >= 0 && s->engine) {
                 s->engine->qwen4_pool_used &= ~(UINT64_C(1) << s->qwen4_slot);
             }
+            if (s->qwen4_graph_ready && !s->qwen4_graph.owns_scratch && s->engine) s->engine->qwen4_arena_users--;
             qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
