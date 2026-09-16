@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+<style>text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; } .title { font-size: 22px; font-weight: 700; fill: #1f2933; } .axis-label { font-size: 14px; font-weight: 600; fill: #334155; } .tick { font-size: 12px; fill: #64748b; } .legend { font-size: 12px; font-weight: 600; fill: #1f2933; }</style>
+<rect width="960" height="540" fill="#ffffff"/>
+<text class="title" x="480.0" y="34" text-anchor="middle">Qwen3.8 Flash Next on M5 Max: session memory by context</text>
+<line x1="82" y1="468.00" x2="864" y2="468.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="72" y="472.00" text-anchor="end">0</text>
+<line x1="82" y1="376.00" x2="864" y2="376.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="72" y="380.00" text-anchor="end">10</text>
+<line x1="82" y1="284.00" x2="864" y2="284.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="72" y="288.00" text-anchor="end">20</text>
+<line x1="82" y1="192.00" x2="864" y2="192.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="72" y="196.00" text-anchor="end">30</text>
+<line x1="82" y1="100.00" x2="864" y2="100.00" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="72" y="104.00" text-anchor="end">40</text>
+<line x1="82.00" y1="100" x2="82.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="82.00" y="486" text-anchor="middle">4k</text>
+<line x1="212.33" y1="100" x2="212.33" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="212.33" y="486" text-anchor="middle">8k</text>
+<line x1="342.67" y1="100" x2="342.67" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="342.67" y="486" text-anchor="middle">16k</text>
+<line x1="473.00" y1="100" x2="473.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="473.00" y="486" text-anchor="middle">32k</text>
+<line x1="603.33" y1="100" x2="603.33" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="603.33" y="486" text-anchor="middle">64k</text>
+<line x1="733.67" y1="100" x2="733.67" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="733.67" y="486" text-anchor="middle">128k</text>
+<line x1="864.00" y1="100" x2="864.00" y2="468" stroke="#e2e8f0" stroke-width="1"/>
+<text class="tick" x="864.00" y="486" text-anchor="middle">256k</text>
+<line x1="82" y1="468" x2="864" y2="468" stroke="#334155" stroke-width="1.2"/>
+<line x1="82" y1="100" x2="82" y2="468" stroke="#334155" stroke-width="1.2"/>
+<text class="axis-label" x="473.0" y="510" text-anchor="middle">context size (tokens, log scale)</text>
+<text class="axis-label" x="20" y="284.0" text-anchor="middle" transform="rotate(-90 20 284.0)">session state, GiB (caches + shared arena; model excluded)</text>
+<path d="M82.00,430.92 L212.33,394.12 L342.67,390.17 L473.00,382.44 L603.33,366.80 L733.67,335.61 L864.00,273.24" fill="none" stroke="#93c5fd" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="82.00" cy="430.92" r="3.2" fill="#93c5fd"/>
+<circle cx="212.33" cy="394.12" r="3.2" fill="#93c5fd"/>
+<circle cx="342.67" cy="390.17" r="3.2" fill="#93c5fd"/>
+<circle cx="473.00" cy="382.44" r="3.2" fill="#93c5fd"/>
+<circle cx="603.33" cy="366.80" r="3.2" fill="#93c5fd"/>
+<circle cx="733.67" cy="335.61" r="3.2" fill="#93c5fd"/>
+<circle cx="864.00" cy="273.24" r="3.2" fill="#93c5fd"/>
+<text class="tick" x="870.00" y="277.24" fill="#93c5fd">21.2 GiB</text>
+<path d="M82.00,429.54 L212.33,391.46 L342.67,384.92 L473.00,371.86 L603.33,345.73 L733.67,293.38 L864.00,188.87" fill="none" stroke="#60a5fa" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="82.00" cy="429.54" r="3.2" fill="#60a5fa"/>
+<circle cx="212.33" cy="391.46" r="3.2" fill="#60a5fa"/>
+<circle cx="342.67" cy="384.92" r="3.2" fill="#60a5fa"/>
+<circle cx="473.00" cy="371.86" r="3.2" fill="#60a5fa"/>
+<circle cx="603.33" cy="345.73" r="3.2" fill="#60a5fa"/>
+<circle cx="733.67" cy="293.38" r="3.2" fill="#60a5fa"/>
+<circle cx="864.00" cy="188.87" r="3.2" fill="#60a5fa"/>
+<text class="tick" x="870.00" y="192.87" fill="#60a5fa">30.3 GiB</text>
+<path d="M82.00,426.88 L212.33,386.12 L342.67,374.34 L473.00,350.70 L603.33,303.50 L733.67,209.11" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="82.00" cy="426.88" r="3.2" fill="#2563eb"/>
+<circle cx="212.33" cy="386.12" r="3.2" fill="#2563eb"/>
+<circle cx="342.67" cy="374.34" r="3.2" fill="#2563eb"/>
+<circle cx="473.00" cy="350.70" r="3.2" fill="#2563eb"/>
+<circle cx="603.33" cy="303.50" r="3.2" fill="#2563eb"/>
+<circle cx="733.67" cy="209.11" r="3.2" fill="#2563eb"/>
+<text class="tick" x="739.67" y="213.11" fill="#2563eb">28.1 GiB</text>
+<path d="M82.00,421.54 L212.33,375.54 L342.67,353.18 L473.00,308.47 L603.33,219.14" fill="none" stroke="#1d4ed8" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="82.00" cy="421.54" r="3.2" fill="#1d4ed8"/>
+<circle cx="212.33" cy="375.54" r="3.2" fill="#1d4ed8"/>
+<circle cx="342.67" cy="353.18" r="3.2" fill="#1d4ed8"/>
+<circle cx="473.00" cy="308.47" r="3.2" fill="#1d4ed8"/>
+<circle cx="603.33" cy="219.14" r="3.2" fill="#1d4ed8"/>
+<text class="tick" x="609.33" y="223.14" fill="#1d4ed8">27.1 GiB</text>
+<path d="M82.00,410.87 L212.33,354.29 L342.67,310.86 L473.00,224.02" fill="none" stroke="#1e3a8a" stroke-width="2.2" stroke-linejoin="round"/>
+<circle cx="82.00" cy="410.87" r="3.2" fill="#1e3a8a"/>
+<circle cx="212.33" cy="354.29" r="3.2" fill="#1e3a8a"/>
+<circle cx="342.67" cy="310.86" r="3.2" fill="#1e3a8a"/>
+<circle cx="473.00" cy="224.02" r="3.2" fill="#1e3a8a"/>
+<text class="tick" x="479.00" y="228.02" fill="#1e3a8a">26.5 GiB</text>
+<path d="M82.00,429.36 L212.33,394.03 L342.67,390.17 L473.00,382.35 L603.33,366.71 L733.67,335.52 L864.00,273.14" fill="none" stroke="#93c5fd" stroke-width="2.2" stroke-dasharray="7 4" stroke-linejoin="round"/>
+<circle cx="82.00" cy="429.36" r="3.2" fill="#93c5fd"/>
+<circle cx="212.33" cy="394.03" r="3.2" fill="#93c5fd"/>
+<circle cx="342.67" cy="390.17" r="3.2" fill="#93c5fd"/>
+<circle cx="473.00" cy="382.35" r="3.2" fill="#93c5fd"/>
+<circle cx="603.33" cy="366.71" r="3.2" fill="#93c5fd"/>
+<circle cx="733.67" cy="335.52" r="3.2" fill="#93c5fd"/>
+<circle cx="864.00" cy="273.14" r="3.2" fill="#93c5fd"/>
+<path d="M82.00,427.98 L212.33,391.36 L342.67,384.74 L473.00,371.68 L603.33,345.55 L733.67,293.29 L864.00,188.69" fill="none" stroke="#60a5fa" stroke-width="2.2" stroke-dasharray="7 4" stroke-linejoin="round"/>
+<circle cx="82.00" cy="427.98" r="3.2" fill="#60a5fa"/>
+<circle cx="212.33" cy="391.36" r="3.2" fill="#60a5fa"/>
+<circle cx="342.67" cy="384.74" r="3.2" fill="#60a5fa"/>
+<circle cx="473.00" cy="371.68" r="3.2" fill="#60a5fa"/>
+<circle cx="603.33" cy="345.55" r="3.2" fill="#60a5fa"/>
+<circle cx="733.67" cy="293.29" r="3.2" fill="#60a5fa"/>
+<circle cx="864.00" cy="188.69" r="3.2" fill="#60a5fa"/>
+<path d="M82.00,425.22 L212.33,385.94 L342.67,374.07 L473.00,350.52 L603.33,303.23 L733.67,208.84" fill="none" stroke="#2563eb" stroke-width="2.2" stroke-dasharray="7 4" stroke-linejoin="round"/>
+<circle cx="82.00" cy="425.22" r="3.2" fill="#2563eb"/>
+<circle cx="212.33" cy="385.94" r="3.2" fill="#2563eb"/>
+<circle cx="342.67" cy="374.07" r="3.2" fill="#2563eb"/>
+<circle cx="473.00" cy="350.52" r="3.2" fill="#2563eb"/>
+<circle cx="603.33" cy="303.23" r="3.2" fill="#2563eb"/>
+<circle cx="733.67" cy="208.84" r="3.2" fill="#2563eb"/>
+<path d="M82.00,419.70 L212.33,375.08 L342.67,352.72 L473.00,308.01 L603.33,218.68" fill="none" stroke="#1d4ed8" stroke-width="2.2" stroke-dasharray="7 4" stroke-linejoin="round"/>
+<circle cx="82.00" cy="419.70" r="3.2" fill="#1d4ed8"/>
+<circle cx="212.33" cy="375.08" r="3.2" fill="#1d4ed8"/>
+<circle cx="342.67" cy="352.72" r="3.2" fill="#1d4ed8"/>
+<circle cx="473.00" cy="308.01" r="3.2" fill="#1d4ed8"/>
+<circle cx="603.33" cy="218.68" r="3.2" fill="#1d4ed8"/>
+<path d="M82.00,408.57 L212.33,353.46 L342.67,310.04 L473.00,223.19" fill="none" stroke="#1e3a8a" stroke-width="2.2" stroke-dasharray="7 4" stroke-linejoin="round"/>
+<circle cx="82.00" cy="408.57" r="3.2" fill="#1e3a8a"/>
+<circle cx="212.33" cy="353.46" r="3.2" fill="#1e3a8a"/>
+<circle cx="342.67" cy="310.04" r="3.2" fill="#1e3a8a"/>
+<circle cx="473.00" cy="223.19" r="3.2" fill="#1e3a8a"/>
+<line x1="88" y1="58" x2="114" y2="58" stroke="#93c5fd" stroke-width="2.5"/>
+<text class="legend" x="120" y="62">C=1 plain</text>
+<line x1="205" y1="58" x2="231" y2="58" stroke="#60a5fa" stroke-width="2.5"/>
+<text class="legend" x="237" y="62">C=2 plain</text>
+<line x1="322" y1="58" x2="348" y2="58" stroke="#2563eb" stroke-width="2.5"/>
+<text class="legend" x="354" y="62">C=4 plain</text>
+<line x1="439" y1="58" x2="465" y2="58" stroke="#1d4ed8" stroke-width="2.5"/>
+<text class="legend" x="471" y="62">C=8 plain</text>
+<line x1="556" y1="58" x2="582" y2="58" stroke="#1e3a8a" stroke-width="2.5"/>
+<text class="legend" x="588" y="62">C=16 plain</text>
+<line x1="680" y1="58" x2="706" y2="58" stroke="#93c5fd" stroke-width="2.5" stroke-dasharray="7 4"/>
+<text class="legend" x="712" y="62">C=1 MTP</text>
+<line x1="88" y1="75" x2="114" y2="75" stroke="#60a5fa" stroke-width="2.5" stroke-dasharray="7 4"/>
+<text class="legend" x="120" y="79">C=2 MTP</text>
+<line x1="191" y1="75" x2="217" y2="75" stroke="#2563eb" stroke-width="2.5" stroke-dasharray="7 4"/>
+<text class="legend" x="223" y="79">C=4 MTP</text>
+<line x1="294" y1="75" x2="320" y2="75" stroke="#1d4ed8" stroke-width="2.5" stroke-dasharray="7 4"/>
+<text class="legend" x="326" y="79">C=8 MTP</text>
+<line x1="397" y1="75" x2="423" y2="75" stroke="#1e3a8a" stroke-width="2.5" stroke-dasharray="7 4"/>
+<text class="legend" x="429" y="79">C=16 MTP</text>
+</svg>
