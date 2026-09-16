@@ -7,9 +7,9 @@ at 9139e2a. Harness: `speed-bench/session_concurrency_bench`, prompts cut from
 stream (64 for the MTP series), one run per cell. Cells whose sessions would
 not fit the memory budget are skipped by the harness.
 
-![decode t/s by context](m5_max_ctx_sweep_throughput.svg)
+![decode t/s by context](m5_max_ctx_sweep_throughput.png)
 
-![session memory by context](m5_max_ctx_sweep_memory.svg)
+![session memory by context](m5_max_ctx_sweep_memory.png)
 
 Aggregate decode t/s over all streams (C = concurrent streams):
 

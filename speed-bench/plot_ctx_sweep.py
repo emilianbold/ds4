@@ -111,7 +111,7 @@ def svg(series, ctxs, title, y_label, unit, out):
         parts.append(f'<path d="{d}" fill="none" stroke="{color}" stroke-width="2.2"{dash} stroke-linejoin="round"/>')
         for ctx in sorted(pts):
             parts.append(f'<circle cx="{x_of(ctx):.2f}" cy="{y_of(pts[ctx]):.2f}" r="3.2" fill="{color}"/>')
-        if not dashed:
+        if not dashed and label.startswith("C="):
             last = max(pts)
             parts.append(f'<text class="tick" x="{x_of(last) + 6:.2f}" y="{y_of(pts[last]) + 4:.2f}" fill="{color}">{fmt(round(pts[last], 1))}{unit}</text>')
     # legend: rows between the title and the plot

@@ -114,7 +114,6 @@
 <circle cx="603.33" cy="392.91" r="3.2" fill="#ea580c"/>
 <circle cx="733.67" cy="396.77" r="3.2" fill="#ea580c"/>
 <circle cx="864.00" cy="399.74" r="3.2" fill="#ea580c"/>
-<text class="tick" x="870.00" y="403.74" fill="#ea580c">46.4</text>
 <path d="M82.00,393.61 L212.33,393.53 L342.67,388.44 L473.00,393.80 L603.33,393.53 L733.67,392.57 L864.00,402.32" fill="none" stroke="#ea580c" stroke-width="2.2" stroke-dasharray="7 4" stroke-linejoin="round"/>
 <circle cx="82.00" cy="393.61" r="3.2" fill="#ea580c"/>
 <circle cx="212.33" cy="393.53" r="3.2" fill="#ea580c"/>
