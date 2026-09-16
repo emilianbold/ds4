@@ -50257,10 +50257,13 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         return 0;
     }
     /* A projection whose output is narrow gives this grid only a few
-     * threadgroups; split k until the machine has work, then sum the planes.
+     * threadgroups when the batch is a decode step; split k until the
+     * machine has work, then sum the planes.  A prefill chunk's token tiles
+     * already fill it, and its planes would not fit the scratch anyway.
      * The split is chosen so the partials stay small and every threadgroup
      * still walks enough k to amortize its staging. */
     const uint32_t tiles = (out_rows + 31u) / 32u;
+    const uint32_t threadgroups = tiles * ((n_tokens + 31u) / 32u);
     uint32_t n_split = 1u;
     if (!ds4_gpu_env_u64("DS4_QWEN4_NO_DENSE_MM_KSPLIT", 0u, 0u, 1u)) {
         const uint32_t nk = (in_dim + 31u) / 32u;
@@ -50272,7 +50275,7 @@ int ds4_gpu_qwen4_dense_mm_tensor(
          * Splits of 32 and 64 measure exact now and no faster, so the
          * default stays. */
         const uint32_t target = (uint32_t)ds4_gpu_env_u64("DS4_QWEN4_KSPLIT_TILES", 128u, 1u, 4096u);
-        const uint32_t want = tiles >= target ? 1u : (target + tiles - 1u) / tiles;
+        const uint32_t want = threadgroups >= target ? 1u : (target + threadgroups - 1u) / threadgroups;
         n_split = want > nk / 4u ? (nk / 4u ? nk / 4u : 1u) : want;
         if (n_split > 64u) n_split = 64u;
     }
