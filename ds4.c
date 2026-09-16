@@ -53,6 +53,10 @@
 #if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
 #define DS4_HAS_QWEN4_GPU 1
 #endif
+/* the Metal build of that graph: the batched session paths are Metal-only */
+#if defined(DS4_HAS_QWEN4_GPU) && defined(__APPLE__)
+#define DS4_HAS_QWEN4_METAL 1
+#endif
 #ifdef DS4_ROCM_BUILD
 #include "ds4_linux_memory.h"
 #endif
