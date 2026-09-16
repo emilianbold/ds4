@@ -42294,6 +42294,10 @@ struct ds4_engine {
     /* Qwen keeps the same idea in its own graph shape; the first session
      * allocates the arena and hands ownership here. */
     struct ds4_qwen4_gpu_graph *qwen4_shared_workspace;
+    /* batched speculative policy: the drafts' measured acceptance and the
+     * wall time of a plain and of a speculative batched cycle */
+    float qwen4_batch_p, qwen4_batch_ms[2];
+    uint32_t qwen4_batch_cycles, qwen4_batch_spec_cycles;
     /* Recurrent state for every slot of a layer in one tensor, so a batched
      * decode can advance all of its rows in a single dispatch instead of one
      * per session.  Sessions hold views into it and a slot index. */
@@ -79870,6 +79874,29 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         char *err,
         size_t errlen);
 
+#ifdef DS4_HAS_QWEN4_METAL
+/* Whether the next batched cycle should carry drafts.  A draft row is worth
+ * its cost only for the batch as a whole: the seventeenth row opens a second
+ * tile of every dense projection, so rows past it are nearly free and a
+ * batch speculates for every stream or for none.  It pays when
+ * (1 + p) c_plain > c_spec, with p the drafts' acceptance and the two
+ * cycle times measured on this engine (a plain cycle 80 ms, a speculative
+ * one 149 ms at sixteen streams: code at p = 0.94 gains, prose at 0.62
+ * loses).  The engine starts by drafting for sixteen cycles and running
+ * two plain ones, which prices both kinds; from then on the other kind gets
+ * a two-cycle probe, every thirty-two cycles while plain (the text may turn
+ * predictable) and every hundred and twenty-eight while speculating (only
+ * the plain cost can drift), so a stale p or cost cannot hold the decision.
+ * A cycle that switches kind (drafts in and none out, or the reverse)
+ * prices neither. */
+static bool qwen4_batch_spec_next(const ds4_engine *e) {
+    const uint32_t cycle = e->qwen4_batch_cycles;
+    const float p = e->qwen4_batch_p, cp = e->qwen4_batch_ms[0], cs = e->qwen4_batch_ms[1];
+    if (cp <= 0.0f || cs <= 0.0f) return cycle % 32u < 16u;
+    return (1.0f + p) * cp > cs ? cycle % 128u >= 2u : cycle % 32u < 2u;
+}
+#endif
+
 int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
                                                int (*accepted)[3], int *n_accepted,
                                                char *err, size_t errlen) {
@@ -79906,10 +79933,11 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
         const ds4_model *m = &e->model;
         const ds4_weights *w = &e->weights;
         const uint32_t V = DS4_N_VOCAB;
+        const double t0 = now_sec();
         qwen4_batch_member mem[16];
         uint32_t pos0[16], committed[16];
         int parents[16], drafts[16];
-        uint32_t N = 0;
+        uint32_t N = 0, n_draft = 0, n_acc = 0;
         for (int i = 0; i < count; i++) {
             ds4_session *s = items[i].session;
             ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
@@ -79966,6 +79994,8 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                 s->qwen4_spec_cycles++;
                 const bool accept = sample_argmax(rows, V) == mem[i].tokens[1] || qwen4_spec_force_accept();
                 qwen4_spec_note_first_draft(s, accept);
+                n_draft++;
+                n_acc += accept;
                 if (accept) {
                     token_vec_push(&s->checkpoint, mem[i].tokens[1]);
                     memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
@@ -79997,13 +80027,17 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
             accepted[i][1] = committed[i] == 2u ? mem[i].tokens[1] : -1;
             accepted[i][2] = -1;
         }
-        /* the next drafts: a session at its context limit simply gets none */
-        bool room = true;
+        if (n_draft) {
+            e->qwen4_batch_p = qwen4_ema(e->qwen4_batch_p, (float)n_acc / (float)n_draft, e->qwen4_batch_spec_cycles);
+            e->qwen4_batch_spec_cycles++;
+        }
+        /* the next drafts, when the policy wants them: a session at its
+         * context limit simply gets none */
+        bool room = qwen4_batch_spec_next(e) && getenv("DS4_QWEN4_NO_BATCH_DRAFT") == NULL;
         for (int i = 0; i < count; i++) {
             if (items[i].session->qwen4_graph.pos + 2u > items[i].session->qwen4_graph.ctx_cap) room = false;
         }
-        if (room && getenv("DS4_QWEN4_NO_BATCH_DRAFT") == NULL &&
-            qwen4_batch_mtp_drafts(mem, count, committed, parents, pos0, N, arena, m, w, drafts)) {
+        if (room && qwen4_batch_mtp_drafts(mem, count, committed, parents, pos0, N, arena, m, w, drafts)) {
             for (int i = 0; i < count; i++) {
                 ds4_session *s = items[i].session;
                 s->glm_mtp_draft = drafts[i];
@@ -80011,6 +80045,18 @@ int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count
                 s->glm_mtp_have = 1;
             }
         }
+        /* a steady cycle, verifying drafts and making the next, or plain
+         * both ways, prices its kind; the transitions between them do not */
+        if ((n_draft > 0) == room) {
+            float *c = &e->qwen4_batch_ms[n_draft > 0];
+            *c = qwen4_ema(*c, (float)((now_sec() - t0) * 1e3), *c == 0.0f ? 0u : 16u);
+        }
+        if (qwen4_spec_trace()) {
+            fprintf(stderr, "ds4: spec batch policy: cycle %u %s, p %.2f plain %.1f ms spec %.1f ms, next %s\n",
+                    e->qwen4_batch_cycles, n_draft ? "speculative" : "plain", (double)e->qwen4_batch_p,
+                    (double)e->qwen4_batch_ms[0], (double)e->qwen4_batch_ms[1], room ? "drafts" : "plain");
+        }
+        e->qwen4_batch_cycles++;
         return 0;
     }
 #endif
