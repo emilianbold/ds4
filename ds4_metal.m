@@ -9523,6 +9523,7 @@ int ds4_gpu_flush_commands(void) {
     ds4_gpu_stream_expert_cache_note_batch_committed();
 
     g_batch_cb = ds4_gpu_new_command_buffer();
+    g_batch_cb_created_ms = ds4_gpu_now_ms();   /* keep DS4_METAL_CB_TIMES 'encode' per buffer across flushes */
     g_batch_has_work = NO;
     if (g_batch_cb) ds4_gpu_stream_expert_cache_note_batch_created();
     ds4_gpu_timeline_attach(g_batch_cb);
