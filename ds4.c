@@ -41265,6 +41265,85 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
 
+typedef struct {
+    pthread_t thread;
+    const ds4_engram_table *table;
+    const uint32_t *ids;
+    float *out;
+    uint32_t count, ready;
+    bool active, ok, cancel, done;
+} ds41_engram_prefetch;
+
+static void *ds41_engram_prefetch_read(void *arg) {
+    ds41_engram_prefetch *p = arg;
+    p->ok = true;
+    for (uint32_t off = 0; off < p->count; off += 2048u) {
+        const uint32_t count = p->count - off < 2048u ? p->count - off : 2048u;
+        if (__atomic_load_n(&p->cancel, __ATOMIC_RELAXED) ||
+            !ds4_engram_read_batch(p->table, p->ids + (size_t)off * 2u * DS4_ENGRAM_COLS,
+                count, 2u * DS4_ENGRAM_COLS,
+                p->out + (size_t)off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM)) {
+            p->ok = false;
+            break;
+        }
+        /* Publish only completed rows; later disk reads use disjoint memory. */
+        __atomic_store_n(&p->ready, off + count, __ATOMIC_RELEASE);
+    }
+    __atomic_store_n(&p->done, true, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+static bool ds41_engram_prefetch_wait(ds41_engram_prefetch *p, uint32_t rows,
+                                      ds4_session_cancel_fn cancel, void *cancel_ud) {
+    if (!p->active || rows > p->count) return false;
+    while (__atomic_load_n(&p->ready, __ATOMIC_ACQUIRE) < rows) {
+        if (__atomic_load_n(&p->done, __ATOMIC_ACQUIRE))
+            return __atomic_load_n(&p->ready, __ATOMIC_ACQUIRE) >= rows;
+        if (cancel && cancel(cancel_ud)) return false;
+        const struct timespec pause = {.tv_nsec = 1000000};
+        nanosleep(&pause, NULL);
+    }
+    return true;
+}
+
+static bool ds41_engram_prefetch_join(ds41_engram_prefetch *p, bool cancel) {
+    if (!p->active) return true;
+    if (cancel) __atomic_store_n(&p->cancel, true, __ATOMIC_RELAXED);
+    if (pthread_join(p->thread, NULL)) ds4_die("cannot join V4.1 Engram reader safely");
+    p->active = false;
+    return p->ok;
+}
+
+static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, const ds4_engram_table *table,
+                                      const uint32_t *ids, uint32_t count, float *out) {
+    *p = (ds41_engram_prefetch){.table = table, .count = count, .ids = ids, .out = out};
+    if (!p->out || pthread_create(&p->thread, NULL, ds41_engram_prefetch_read, p))
+        return false;
+    p->active = true;
+    return true;
+}
+
+
+
+/* Decode-side helpers for the two per-table readers (PRE_M5 queued decode). */
+static double g_engram_rows_ms = 0.0; static uint32_t g_engram_rows_n = 0;
+static bool ds41_engram_timing(void) { return getenv("DS4_METAL_V41_ENGRAM_TIMING") != NULL; }
+static void ds41_engram_rows_account(double ms) {
+    g_engram_rows_ms += ms;
+    if ((++g_engram_rows_n % 64u) == 0u)
+        fprintf(stderr, "ds4: V4.1 engram rows on the critical path: %.3f ms/token over %u tokens\n",
+                g_engram_rows_ms / g_engram_rows_n, g_engram_rows_n);
+}
+static void ds41_engram_rows_join(ds41_engram_prefetch *pre, bool *joined, bool *ok, bool cancel) {
+    if (*joined) return;
+    *joined = true;
+    const double t0 = ds41_engram_timing() ? now_sec() : 0.0;
+    const bool a = ds41_engram_prefetch_join(&pre[0], cancel);
+    const bool b = ds41_engram_prefetch_join(&pre[1], cancel);
+    if (t0) ds41_engram_rows_account((now_sec() - t0) * 1000.0);
+    if (!(a && b)) *ok = false;
+}
+
 /* PRE_M5 queued decode (2026-09-17): one Apple GPU, resident weights, no
  * per-layer CPU reads. The legacy schedule drains after every layer; the
  * queued one commits without waiting and drains once per token. Read at step
@@ -41300,24 +41379,39 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, &token, 1, &ids[0][0])) return false;
-    for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
-        if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
-        /* Each table has its own buffer and both go up before any command is
-         * queued, so no host write touches memory the GPU may still read. */
-        if (!ds4_gpu_tensor_write(g->engram_rows_tab[i], 0, g->rows[i], sizeof(g->rows[i]))) return false;
+    /* Queued decode reads both Engram tables on reader threads straight into
+     * their upload buffers, overlapping the CPU encode of the first layers; the
+     * readers are joined before the first commit, so no queued command can see
+     * a partial buffer. Legacy mode keeps the synchronous read and upload. Each
+     * table has its own buffer, so no host write ever touches memory the GPU
+     * may still be reading. */
+    const bool queued = ds41_decode_queue_enabled(g);
+    const bool prefetch_rows = queued && !ds41_image_at(g, g->pos) &&
+        !getenv("DS4_METAL_DISABLE_PRE_M5_V41_ENGRAM_PREFETCH");
+    ds41_engram_prefetch rows_pre[2] = {{0}, {0}};
+    bool rows_joined = !prefetch_rows;
+    bool ok = true;
+    const double rows_t0 = !prefetch_rows && ds41_engram_timing() ? now_sec() : 0.0;
+    for (uint32_t i = 0; ok && !ds41_image_at(g, g->pos) && i < 2; i++) {
+        if (prefetch_rows)
+            ok = ds41_engram_prefetch_start(&rows_pre[i], &g->table[i], ids[i], 1,
+                                            ds4_gpu_tensor_contents(g->engram_rows_tab[i]));
+        else
+            ok = ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i]) &&
+                 ds4_gpu_tensor_write(g->engram_rows_tab[i], 0, g->rows[i], sizeof(g->rows[i]));
     }
+    if (rows_t0) ds41_engram_rows_account((now_sec() - rows_t0) * 1000.0);
     ds4_gpu_tensor *const engram_rows_scratch = g->engram_rows;
     const float initial_pre[] = {1, 0, 0, 0};
-    if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
-        !ds4_gpu_begin_commands()) return false;
-    bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
+    if (ok && (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
+               !ds4_gpu_begin_commands())) ok = false;
+    if (ok) ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
     const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
-    const bool queued = !layer_resident && ds41_decode_queue_enabled(g);
     const uint32_t flush_every = queued ? ds41_decode_flush_layers() : 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
@@ -41337,8 +41431,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
          * 14, and before publishing the completed token to the CPU. */
         const bool drain = !queued && (!queue_layers || il == 13 || il + 1u == DS4_N_LAYER);
         if (drain && !ds4_gpu_end_commands()) ok = false;
-        if (ok && queued && flush_every && (il + 1u) % flush_every == 0 && il + 1u < DS4_N_LAYER &&
-            !ds4_gpu_flush_commands()) ok = false;
+        if (ok && queued && flush_every && (il + 1u) % flush_every == 0 && il + 1u < DS4_N_LAYER) {
+            ds41_engram_rows_join(rows_pre, &rows_joined, &ok, false);
+            if (ok && !ds4_gpu_flush_commands()) ok = false;
+        }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
@@ -41347,6 +41443,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);   /* before any commit, or to cancel on failure */
     /* Queued decode leaves the last buffer open for the head, so the token
      * ends in the single wait inside ds41_graph_logits. */
     if ((!queued || !logits || !ok) && ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -41625,66 +41722,6 @@ static bool ds41_decoder_prepare(ds41_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
-typedef struct {
-    pthread_t thread;
-    const ds4_engram_table *table;
-    const uint32_t *ids;
-    float *out;
-    uint32_t count, ready;
-    bool active, ok, cancel, done;
-} ds41_engram_prefetch;
-
-static void *ds41_engram_prefetch_read(void *arg) {
-    ds41_engram_prefetch *p = arg;
-    p->ok = true;
-    for (uint32_t off = 0; off < p->count; off += 2048u) {
-        const uint32_t count = p->count - off < 2048u ? p->count - off : 2048u;
-        if (__atomic_load_n(&p->cancel, __ATOMIC_RELAXED) ||
-            !ds4_engram_read_batch(p->table, p->ids + (size_t)off * 2u * DS4_ENGRAM_COLS,
-                count, 2u * DS4_ENGRAM_COLS,
-                p->out + (size_t)off * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM)) {
-            p->ok = false;
-            break;
-        }
-        /* Publish only completed rows; later disk reads use disjoint memory. */
-        __atomic_store_n(&p->ready, off + count, __ATOMIC_RELEASE);
-    }
-    __atomic_store_n(&p->done, true, __ATOMIC_RELEASE);
-    return NULL;
-}
-
-static bool ds41_engram_prefetch_wait(ds41_engram_prefetch *p, uint32_t rows,
-                                      ds4_session_cancel_fn cancel, void *cancel_ud) {
-    if (!p->active || rows > p->count) return false;
-    while (__atomic_load_n(&p->ready, __ATOMIC_ACQUIRE) < rows) {
-        if (__atomic_load_n(&p->done, __ATOMIC_ACQUIRE))
-            return __atomic_load_n(&p->ready, __ATOMIC_ACQUIRE) >= rows;
-        if (cancel && cancel(cancel_ud)) return false;
-        const struct timespec pause = {.tv_nsec = 1000000};
-        nanosleep(&pause, NULL);
-    }
-    return true;
-}
-
-static bool ds41_engram_prefetch_join(ds41_engram_prefetch *p, bool cancel) {
-    if (!p->active) return true;
-    if (cancel) __atomic_store_n(&p->cancel, true, __ATOMIC_RELAXED);
-    if (pthread_join(p->thread, NULL)) ds4_die("cannot join V4.1 Engram reader safely");
-    p->active = false;
-    return p->ok;
-}
-
-static bool ds41_engram_prefetch_start(ds41_engram_prefetch *p, ds41_gpu_graph *g,
-                                      uint32_t table, uint32_t count) {
-    *p = (ds41_engram_prefetch){.table = &g->table[table], .count = count,
-        .ids = g->prefill_ids[0][table], .out = ds4_gpu_tensor_contents(g->engram_prefetch)};
-    if (!p->out || pthread_create(&p->thread, NULL, ds41_engram_prefetch_read, p))
-        return false;
-    p->active = true;
-    return true;
-}
-
-
 static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) {
     if (count < 8192u && g->prefill_cap > 2048u) return 2048u;
     /* Keep the decoder suffix optimization for 8k prompts. */
@@ -41733,7 +41770,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool pipeline_engram = overlap_engram &&
         !getenv("DS4_METAL_DISABLE_V41_ENGRAM_PIPELINE");
     bool engram_prefetched = overlap_engram &&
-        ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
+        ds41_engram_prefetch_start(&engram_prefetch, &g->table[0], g->prefill_ids[0][0], total_count,
+                                   ds4_gpu_tensor_contents(g->engram_prefetch));
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -41749,7 +41787,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         /* Layer 1 no longer reads the prefix buffer. Fill it for layer 14
          * while the intervening encoder layers run. The table stays on disk. */
         if (il == 2u) engram_prefetched = overlap_engram &&
-            ds41_engram_prefetch_start(&engram_prefetch, g, 1, total_count);
+            ds41_engram_prefetch_start(&engram_prefetch, &g->table[1], g->prefill_ids[0][1], total_count,
+                                   ds4_gpu_tensor_contents(g->engram_prefetch));
         const double t0 = profile ? now_sec() : 0;
         if (g->streaming) {
 #ifdef __APPLE__
