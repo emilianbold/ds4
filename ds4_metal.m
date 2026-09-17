@@ -412,6 +412,7 @@ static id<MTLComputePipelineState> g_dsv4_head_rms_norm_rope_tail_pipeline;
 static bool g_use_dsv4_head_rms_norm_rope_tail_pipeline;
 /* V4.1 decode knobs read once per command batch instead of ~1,000 times per token (2026-09-17). */
 static bool g_v41_linear_bf16_disabled, g_v41_topk_shuffle_disabled, g_v41_topk_prefix_disabled;
+static bool g_pre_m5_small_compute_copy;   /* PRE_M5: small copies as a copy kernel, not a blit encoder */
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
@@ -9375,6 +9376,9 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     return 1;
 }
 
+static int ds4_gpu_encode_cpy_f32_f32_3d(id<MTLCommandBuffer>, id<MTLBuffer>, NSUInteger, id<MTLBuffer>, NSUInteger,
+                                         uint32_t, uint32_t, uint32_t, uint64_t, uint64_t, uint64_t, uint64_t);
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes) {
@@ -9386,6 +9390,19 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (src_offset > s.bytes || bytes > s.bytes - src_offset) return 0;
     if (bytes == 0) return 1;
     if (!g_batch_cb) return 0;
+
+    /* PRE_M5 (2026-09-17): a blit closes the persistent compute encoder, and
+     * the V4.1 decode step issues ~85 small copies per token. Word-aligned
+     * copies up to 1 MiB run as the f32 copy kernel on the open encoder
+     * instead; anything else, and prefill's large ring copies, keep the DMA
+     * blit. A copy is a copy, so results are identical. */
+    if (g_pre_m5_small_compute_copy && bytes <= (1ull << 20) && (bytes & 3u) == 0 &&
+        ((s.offset + src_offset) & 3u) == 0 && ((d.offset + dst_offset) & 3u) == 0) {
+        g_batch_has_work = YES;
+        if (ds4_gpu_encode_cpy_f32_f32_3d(g_batch_cb, s.buffer, (NSUInteger)(s.offset + src_offset),
+                d.buffer, (NSUInteger)(d.offset + dst_offset), (uint32_t)(bytes / 4u), 1u, 1u,
+                bytes, bytes, bytes, bytes)) return 1;
+    }
 
     /* C inference callers have no surrounding autorelease pool. In particular,
      * validation-layer blit bookkeeping otherwise accumulates across tokens. */
@@ -9521,6 +9538,8 @@ int ds4_gpu_begin_commands(void) {
         !g_ssd_streaming_mode &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
+    g_pre_m5_small_compute_copy = ds4_gpu_device_is_pre_m5_apple_silicon() &&
+        getenv("DS4_METAL_DISABLE_PRE_M5_SMALL_COMPUTE_COPY") == NULL;
     g_v41_linear_bf16_disabled = getenv("DS4_METAL_DISABLE_V41_LINEAR_BF16") != NULL;
     g_v41_topk_shuffle_disabled = getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") != NULL;
     g_v41_topk_prefix_disabled = getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") != NULL;
