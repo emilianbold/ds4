@@ -41386,6 +41386,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * table has its own buffer, so no host write ever touches memory the GPU
      * may still be reading. */
     const bool queued = ds41_decode_queue_enabled(g);
+#if defined(__APPLE__)
+    /* Allocation-free pipeline lookups for this step only (restored on every exit). */
+    const int previous_fast_lookup = ds4_gpu_set_decode_pipeline_fast_lookup(0);
+    if (queued && !getenv("DS4_METAL_DISABLE_PRE_M5_V41_DECODE_PIPELINE_FAST_LOOKUP"))
+        (void)ds4_gpu_set_decode_pipeline_fast_lookup(1);
+#endif
     const bool prefetch_rows = queued && !ds41_image_at(g, g->pos) &&
         !getenv("DS4_METAL_DISABLE_PRE_M5_V41_ENGRAM_PREFETCH");
     ds41_engram_prefetch rows_pre[2] = {{0}, {0}};
@@ -41451,6 +41457,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
     if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
     g->engram_rows = engram_rows_scratch;
+#if defined(__APPLE__)
+    (void)ds4_gpu_set_decode_pipeline_fast_lookup(previous_fast_lookup);
+#endif
     if (!ok) {
         g->valid = false;
         return false;

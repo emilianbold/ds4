@@ -410,6 +410,8 @@ static id<MTLComputePipelineState> g_rms_norm_scale_pipeline;
 static id<MTLComputePipelineState> g_dsv4_qkv_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_dsv4_head_rms_norm_rope_tail_pipeline;
 static bool g_use_dsv4_head_rms_norm_rope_tail_pipeline;
+/* V4.1 decode knobs read once per command batch instead of ~1,000 times per token (2026-09-17). */
+static bool g_v41_linear_bf16_disabled, g_v41_topk_shuffle_disabled, g_v41_topk_prefix_disabled;
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_pipeline;
 static id<MTLComputePipelineState> g_hc_split_weighted_sum_norm_pipeline;
@@ -2611,14 +2613,37 @@ static id<MTLComputePipelineState> ds4_gpu_get_mul_mm_id_pipeline(
     return pipeline;
 }
 
+#define DS4_METAL_DECODE_PIPELINE_FAST_NSG_NONE INT16_MIN
+static bool ds4_gpu_decode_pipeline_fast_key(const char *, int16_t, int16_t, uint16_t *, uint64_t *);
+static id<MTLComputePipelineState> ds4_gpu_decode_pipeline_fast_cache_lookup(const char *, int16_t, int16_t, uint16_t, uint64_t);
+static void ds4_gpu_decode_pipeline_fast_cache_insert(const char *, int16_t, int16_t, uint16_t, uint64_t, id<MTLComputePipelineState>);
+
 static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
         const char *function_name) {
+    /* PRE_M5 V4.1 decode (2026-09-17): the allocation-free lookup the mul_mv
+     * getters use, keyed with a sentinel nsg so a plain name can never alias
+     * a mul_mv entry. Only consulted while the decode step arms it. */
+    uint16_t fast_name_len = 0;
+    uint64_t fast_hash = 0;
+    const bool fast_key_valid = g_decode_pipeline_fast_lookup_active &&
+        ds4_gpu_decode_pipeline_fast_key(function_name, DS4_METAL_DECODE_PIPELINE_FAST_NSG_NONE,
+                                         DS4_METAL_DECODE_PIPELINE_FAST_NXPSG_NONE,
+                                         &fast_name_len, &fast_hash);
+    if (fast_key_valid) {
+        id<MTLComputePipelineState> fast_cached = ds4_gpu_decode_pipeline_fast_cache_lookup(
+            function_name, DS4_METAL_DECODE_PIPELINE_FAST_NSG_NONE,
+            DS4_METAL_DECODE_PIPELINE_FAST_NXPSG_NONE, fast_name_len, fast_hash);
+        if (fast_cached) return fast_cached;
+    }
     NSString *key = [NSString stringWithFormat:@"%s", function_name];
     id<MTLComputePipelineState> cached = [g_pipeline_cache objectForKey:key];
     if (cached) {
         /* Failed lookups are remembered as NSNull so the error prints once
          * per name instead of on every dispatch. */
         if (cached == (id<MTLComputePipelineState>)[NSNull null]) return nil;
+        if (fast_key_valid)
+            ds4_gpu_decode_pipeline_fast_cache_insert(function_name, DS4_METAL_DECODE_PIPELINE_FAST_NSG_NONE,
+                DS4_METAL_DECODE_PIPELINE_FAST_NXPSG_NONE, fast_name_len, fast_hash, cached);
         return cached;
     }
 
@@ -2640,6 +2665,9 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
     }
 
     [g_pipeline_cache setObject:pipeline forKey:key];
+    if (fast_key_valid)
+        ds4_gpu_decode_pipeline_fast_cache_insert(function_name, DS4_METAL_DECODE_PIPELINE_FAST_NSG_NONE,
+            DS4_METAL_DECODE_PIPELINE_FAST_NXPSG_NONE, fast_name_len, fast_hash, pipeline);
     return pipeline;
 }
 
@@ -9493,6 +9521,9 @@ int ds4_gpu_begin_commands(void) {
         !g_ssd_streaming_mode &&
         ds4_gpu_device_is_pre_m5_apple_silicon() &&
         getenv("DS4_METAL_DISABLE_PRE_M5_HEAD_RMS_ROPE_PIPELINE_STATIC") == NULL;
+    g_v41_linear_bf16_disabled = getenv("DS4_METAL_DISABLE_V41_LINEAR_BF16") != NULL;
+    g_v41_topk_shuffle_disabled = getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") != NULL;
+    g_v41_topk_prefix_disabled = getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") != NULL;
     g_batch_cb_created_ms = ds4_gpu_now_ms();
     g_batch_cb = ds4_gpu_new_command_buffer();
     g_batch_has_work = NO;
@@ -19037,11 +19068,11 @@ static int ds4_gpu_indexer_topk_tensor_impl(
 
     @autoreleasepool {
         id<MTLComputePipelineState> sort_pipeline = causal_ratio ?
-            ds4_gpu_get_pipeline(getenv("DS4_METAL_DISABLE_V41_TOPK_SHUFFLE") ?
+            ds4_gpu_get_pipeline(g_v41_topk_shuffle_disabled ?
                 "kernel_argsort_f32_i32_desc_causal" : "kernel_argsort_f32_i32_desc_causal_shuffle") :
             g_argsort_f32_i32_desc_pipeline;
         id<MTLComputePipelineState> merge_pipeline = causal_ratio ?
-            ds4_gpu_get_pipeline(top_k == 512u && !getenv("DS4_METAL_DISABLE_V41_TOPK_PREFIX") ?
+            ds4_gpu_get_pipeline(top_k == 512u && !g_v41_topk_prefix_disabled ?
                 "kernel_argsort_merge_f32_i32_desc_causal_prefix" :
                 "kernel_argsort_merge_f32_i32_desc_causal") : g_argsort_merge_f32_i32_desc_pipeline;
         if (!sort_pipeline || !merge_pipeline) return 0;
@@ -47825,7 +47856,7 @@ int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
         const uint64_t count = (uint64_t)width * rows;
         const bool linear = format == DS4_V41_BF16 && count <= UINT32_MAX &&
             ds4_gpu_tensor_offset(x) % 16u == 0 &&
-            !getenv("DS4_METAL_DISABLE_V41_LINEAR_BF16");
+            !g_v41_linear_bf16_disabled;
         id<MTLComputePipelineState> pipeline = ds4_gpu_get_pipeline(linear ?
             "kernel_dsv41_bf16_linear" : "kernel_dsv41_quantize");
         if (!pipeline) return 0;
