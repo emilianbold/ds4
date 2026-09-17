@@ -40898,10 +40898,10 @@ static bool ds41_hc_mix_batch(ds41_prefill_row *b, const ds4_model *m,
 
 static bool ds41_before_attention_batch(ds41_gpu_graph *g, ds41_prefill_row *b,
                                          const ds4_model *m, const ds4_layer_weights *l,
-                                         uint32_t il, uint32_t count) {
+                                         uint32_t il, uint32_t count, ds4_gpu_tensor *engram_rows) {
     if (ds41_engram_layer(il)) {
         const uint32_t i = il == 1 ? 0 : 1;
-        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, b->engram_rows, count, true) ||
+        if (!ds41_matmul_batch(b->engram_kv, m, l->engram_kv, engram_rows, count, true) ||
             !ds4_gpu_dsv41_engram_add(b->residual, b->engram_kv,
                 g->engram_q_norm[i], g->engram_k_norm[i], g->image_count ? g->image_text_mask : NULL,
                 DS4_N_EMBD, count, DS4_RMS_EPS))
@@ -41423,6 +41423,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
+        /* Layer 1 is the first encode that references the row buffers: join here
+         * so no later commit, wherever it happens, can see a partial buffer. */
+        if (queued && il == 1u) ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);
+        if (!ok) break;
         /* Point the consumer at this layer's own upload buffer (host-side only). */
         if (ds41_engram_layer(il)) g->engram_rows = g->engram_rows_tab[il == 1 ? 0 : 1];
         if (ok) {
@@ -41934,7 +41938,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                          off * bytes, count * bytes) != 0;
             }
             if (ok && batch_hc)
-                ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count, active.engram_rows);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -42124,16 +42128,35 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const bool prefill_only = prefill_rows == rows;
     const bool shared_owner = g->tp_world == 2 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    /* PRE_M5 queued batched decode (2026-09-17): both Engram tables are read
+     * by reader threads straight into per-row upload slots — table 0 into
+     * batch.engram_rows, table 1 into the prefill staging buffer, which is
+     * idle during decode — so layer 14 no longer reuses layer 1's storage and
+     * the mid-step drain goes away; the step flushes every few layers without
+     * waiting, as ds41_graph_step does. Legacy mode is the old schedule. */
+    const bool queued = ds41_decode_queue_enabled(g) &&
+        ds4_gpu_tensor_bytes(g->engram_prefetch) >=
+            (uint64_t)rows * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float);
+    const uint32_t flush_every = queued ? ds41_decode_flush_layers() : 0u;
+    uint32_t ids_all[DS4_TP_BATCH_MAX_ROWS][2][DS4_ENGRAM_COLS];
+    ds41_engram_prefetch rows_pre[2] = {{0}, {0}};
+    bool rows_joined = !queued;
+    ds4_gpu_tensor *engram_rows_tab1 = NULL;
+#if defined(__APPLE__)
+    const int previous_fast_lookup = ds4_gpu_set_decode_pipeline_fast_lookup(0);
+    if (queued && !getenv("DS4_METAL_DISABLE_PRE_M5_V41_DECODE_PIPELINE_FAST_LOOKUP"))
+        (void)ds4_gpu_set_decode_pipeline_fast_lookup(1);
+#endif
     ds41_prefill_row active = {0};
     ds4_engram_history history[DS4_TP_BATCH_MAX_ROWS];
     uint32_t positions[DS4_TP_BATCH_MAX_ROWS];
     /* Only the leading prefill rows share a session. Keep their disk reads
      * and hash history distinct until the final row is published. */
-    float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = prefill_rows > 1 ?
+    float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] = !queued && prefill_rows > 1 ?
         malloc(prefill_rows * sizeof(*engram)) : NULL;
     ds4_gpu_tensor *queries[DS4_TP_BATCH_MAX_ROWS] = {0};
     ds4_gpu_tensor *heads[DS4_TP_BATCH_MAX_ROWS] = {0};
-    bool ok = rows <= g->prefill_cap && (prefill_rows <= 1 || engram);
+    bool ok = rows <= g->prefill_cap && (queued || prefill_rows <= 1 || engram);
 #define DS41_SESSION_VIEW(name, width) \
     if (ok) ok = (active.name = ds4_gpu_tensor_view(g->batch.name, 0, \
         (uint64_t)rows * (width) * sizeof(float))) != NULL;
@@ -42148,24 +42171,59 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
     const float initial_pre[] = {1, 0, 0, 0};
     for (int i = 0; ok && i < count; i++) {
         ds41_gpu_graph *s = graphs[i];
-        uint32_t ids[2][DS4_ENGRAM_COLS];
+        uint32_t (*const ids)[DS4_ENGRAM_COLS] = ids_all[i];
         const bool continued = i > 0 && (uint32_t)i < prefill_rows;
         positions[i] = s->pos + (continued ? (uint32_t)i : 0u);
         history[i] = continued ? history[i - 1] : s->history;
         ok = ds4_engram_hash(&s->engram, &history[i], &tokens[i], NULL, 1, &ids[0][0]);
-        float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
-            engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
-        for (unsigned table = 0; ok && table < 2; table++)
-            ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        if (!queued) {
+            float (*disk_rows)[DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
+                engram && (uint32_t)i < prefill_rows ? engram[i] : s->rows;
+            for (unsigned table = 0; ok && table < 2; table++)
+                ok = ds4_engram_read(&s->table[table], ids[table], DS4_ENGRAM_COLS, disk_rows[table]);
+        }
         if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].pre, 0, initial_pre, sizeof(initial_pre)) &&
             ds4_gpu_embed_token_hc_tensor(g->rows_view[i].residual, model->map, model->size,
                 weights->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)tokens[i], DS4_N_EMBD, DS4_N_HC);
+    }
+    if (ok && queued) {
+        engram_rows_tab1 = ds4_gpu_tensor_view(g->engram_prefetch, 0,
+            (uint64_t)rows * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * sizeof(float));
+        /* Every session maps the same GGUF, so the workspace's table handles
+         * serve all rows; row i lands at rows_view[i].engram_rows (table 0)
+         * and at the same offset of the staging buffer (table 1). The readers
+         * are joined before the first commit, so no queued command can see a
+         * partial slot. */
+        if (engram_rows_tab1 && getenv("DS4_METAL_DISABLE_PRE_M5_V41_BATCH_ENGRAM_READERS")) {
+            /* Diagnostic: the queued schedule with synchronous per-row reads and
+             * uploads (table 1 into the staging buffer), no reader threads. */
+            for (int i = 0; ok && i < count; i++) {
+                ds41_gpu_graph *s = graphs[i];
+                for (unsigned table = 0; ok && table < 2; table++)
+                    ok = ds4_engram_read(&s->table[table], ids_all[i][table], DS4_ENGRAM_COLS, s->rows[table]);
+                if (ok) ok = ds4_gpu_tensor_write(g->rows_view[i].engram_rows, 0, s->rows[0], sizeof(s->rows[0])) &&
+                    ds4_gpu_tensor_write(g->engram_prefetch, (uint64_t)i * sizeof(s->rows[1]), s->rows[1], sizeof(s->rows[1]));
+            }
+            rows_joined = true;
+        } else {
+            ok = engram_rows_tab1 != NULL &&
+                ds41_engram_prefetch_start(&rows_pre[0], &g->table[0], &ids_all[0][0][0], rows,
+                                           ds4_gpu_tensor_contents(g->batch.engram_rows)) &&
+                ds41_engram_prefetch_start(&rows_pre[1], &g->table[1], &ids_all[0][1][0], rows,
+                                           ds4_gpu_tensor_contents(g->engram_prefetch));
+        }
     }
     if (ok) ok = ds4_gpu_tensor_write(g->prefill_tokens, 0, tokens, rows * sizeof(int));
     uint32_t il = 0;
     for (; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
-        if (ds41_engram_layer(il)) {
+        /* Layer 1 is the first Engram consumer: join the readers before it is
+         * encoded, so no command that reads the row buffers can be committed
+         * while a reader may still be writing. Nothing in layer 0 reads them;
+         * do not move this later than layer 1. */
+        if (queued && il == 1u) ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);
+        if (!ok) break;
+        if (!queued && ds41_engram_layer(il)) {
             const unsigned table = il == 1 ? 0 : 1;
             for (int i = 0; ok && i < count; i++) {
                 ds41_gpu_graph *s = graphs[i];
@@ -42174,7 +42232,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     sizeof(s->rows[table]));
             }
         }
-        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
+        if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows,
+                queued && il == 14u ? engram_rows_tab1 : active.engram_rows) &&
             ds41_attention_project_batch(g, model, l, rows);
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
@@ -42198,9 +42257,19 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             ds4_gpu_hc_expand_split_tensor(active.residual, active.block, active.after_attn,
                 active.ffn_split, DS4_N_EMBD, DS4_N_HC) &&
             ds4_gpu_dsv41_quantize(active.residual, DS4_N_EMBD * DS4_N_HC, rows, DS4_V41_BF16);
-        /* The second Engram upload reuses the first one's input storage. */
-        if (ok && il == 13) ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        if (queued) {
+            if (ok && flush_every && (il + 1u) % flush_every == 0 && il + 1u < DS4_N_LAYER) {
+                ds41_engram_rows_join(rows_pre, &rows_joined, &ok, false);
+                if (ok && !ds4_gpu_flush_commands()) ok = false;
+            }
+        } else if (ok && il == 13) {
+            /* The second Engram upload reuses the first one's input storage. */
+            ok = ds4_gpu_end_commands() && ds4_gpu_begin_commands();
+        }
     }
+    /* The readers must be joined before anything is committed: the flushes
+     * above do that; this covers one-buffer mode (k = 0) and failure. */
+    ds41_engram_rows_join(rows_pre, &rows_joined, &ok, !ok);
     const uint64_t logits_bytes = (uint64_t)DS4_N_VOCAB * sizeof(float) /
                                   (g->tp_logits_half ? 2u : 1u);
     /* The final FFN intermediates are dead. Reuse that storage for the head
@@ -42243,7 +42312,11 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         ds4_gpu_tensor_free(queries[i]);
         ds4_gpu_tensor_free(heads[i]);
     }
+    ds4_gpu_tensor_free(engram_rows_tab1);
     free(engram);
+#if defined(__APPLE__)
+    (void)ds4_gpu_set_decode_pipeline_fast_lookup(previous_fast_lookup);
+#endif
     return ok;
 }
 
