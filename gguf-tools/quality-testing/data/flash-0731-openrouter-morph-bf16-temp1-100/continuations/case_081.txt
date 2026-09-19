@@ -1,0 +1,5 @@
+A typical completion might be:
+
+/* This lock protects the shared data structure from concurrent access. */
+
+Or more specifically, depending

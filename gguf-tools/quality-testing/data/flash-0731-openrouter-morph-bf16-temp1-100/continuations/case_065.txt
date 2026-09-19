@@ -1,0 +1,1 @@
+A **trie** (also called a prefix tree or digital tree) represents a set of strings by storing them as

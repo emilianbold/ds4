@@ -1,0 +1,3 @@
+To understand how hash tables handle collisions, we first need to know what a collision is:
+
+- **Hash function**: Takes

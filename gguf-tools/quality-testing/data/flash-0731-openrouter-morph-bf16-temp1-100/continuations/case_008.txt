@@ -1,0 +1,1 @@
+To understand why a GPU **prefill** (processing the entire input prompt at once) is faster than **decode**

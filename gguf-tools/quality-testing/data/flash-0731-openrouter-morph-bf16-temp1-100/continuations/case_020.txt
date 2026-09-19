@@ -1,0 +1,1 @@
+Binary search finds the insertion point for a target value in a sorted array by narrowing the search range until it identifies the exact

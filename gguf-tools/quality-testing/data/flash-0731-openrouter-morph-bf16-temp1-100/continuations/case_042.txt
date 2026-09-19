@@ -1,0 +1,1 @@
+To understand **online softmax**, it helps to first see the *problem* it solves, then walk through the algorithm

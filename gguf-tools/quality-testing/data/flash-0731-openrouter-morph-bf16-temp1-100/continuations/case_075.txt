@@ -1,0 +1,1 @@
+Un **trie** (o albero prefisso) è una struttura dati ad albero che rappresenta un insieme

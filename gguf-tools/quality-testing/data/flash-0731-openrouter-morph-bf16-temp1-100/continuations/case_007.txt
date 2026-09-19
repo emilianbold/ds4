@@ -1,0 +1,1 @@
+Speculative decoding preserves **exact greedy output** because it is designed as a *lossless* acceleration technique. It

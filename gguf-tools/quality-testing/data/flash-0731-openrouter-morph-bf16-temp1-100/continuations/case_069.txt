@@ -1,0 +1,1 @@
+Here’s a concise, practical checklist for reviewing a PR that touches memory lifetimes, ownership, or borrows (especially

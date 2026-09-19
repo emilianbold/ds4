@@ -1,0 +1,1 @@
+Checksums catch accidental corruption because they exploit the mathematical property that even a tiny change in a data input produces a drastically

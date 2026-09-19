@@ -13,6 +13,13 @@ safe to commit and use in release QA.
 - `pro`: 100 DeepSeek V4 PRO preview continuations with API top-logprob slices.
 - `pro-0813`: 100 DeepSeek V4 PRO 0813 continuations with API top-logprob
   slices.
+- `flash-0731-openrouter-morph-bf16-temp1-100`: the same 100 prompts as
+  `flash`, sent to `deepseek/deepseek-v4-flash-0731` through OpenRouter pinned
+  to the Morph bf16 endpoint at temperature 1 with top-20 logprobs. Sampled,
+  not greedy: the official DeepSeek endpoint collapses logprobs to `0`/`-9999`
+  at temperature 0, so this set is the one with usable next-token
+  distributions for `api_overlap` and the other logprob-agreement columns.
+  Judge it by NLL and distribution agreement, not greedy prefix length.
 
 Each fixture directory contains:
 

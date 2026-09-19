@@ -1,0 +1,2 @@
+Here are the first five measurements to take when diagnosing slow generation at long context, ordered by impact and ease of isolation:
+

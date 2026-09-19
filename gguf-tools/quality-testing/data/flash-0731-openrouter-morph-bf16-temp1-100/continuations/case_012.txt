@@ -1,0 +1,1 @@
+Ti propongo un confronto tecnico dettagliato tra `mmap` dei pesi e copia completa

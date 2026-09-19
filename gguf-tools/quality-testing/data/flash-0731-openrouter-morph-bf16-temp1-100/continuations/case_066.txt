@@ -1,0 +1,2 @@
+Testing a command-line parser effectively requires systematically probing the boundaries of expected behavior and beyond. Here’s a comprehensive approach:
+

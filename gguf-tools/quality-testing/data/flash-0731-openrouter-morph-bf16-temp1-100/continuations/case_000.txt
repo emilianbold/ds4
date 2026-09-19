@@ -1,0 +1,3 @@
+To understand B-tree insertion, you have to remember the **core invariant** that defines a B-tree: 
+
+- **

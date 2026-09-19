@@ -1,0 +1,1 @@
+Here's a safe format for storing a model checkpoint header, designed to be robust, versioned, and resistant to common

@@ -1,0 +1,1 @@
+Per spiegare l'inserimento in un **B-tree**, partiamo dalle basi e poi vediamo i casi

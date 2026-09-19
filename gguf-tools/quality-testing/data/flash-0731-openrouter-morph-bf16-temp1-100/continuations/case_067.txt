@@ -1,0 +1,1 @@
+The short answer is that **mmap creates a *mapping*, not an allocation**. The virtual address space is just

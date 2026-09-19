@@ -1,0 +1,1 @@
+To understand the difference between a **mutex** and an **atomic counter**, you have to look at them through two
