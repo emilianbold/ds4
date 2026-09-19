@@ -17,10 +17,10 @@ SPEC.loader.exec_module(validator)
 
 # Literal source-format fixtures keep parser/comparator bugs independent of a
 # fixture generator implementing the same arithmetic as the validator.
-HEADER = "id\tprompt_tokens\ttarget_tokens\tnll\tavg_nll\tfirst_match\tgreedy_lcp\tapi_ref_tokens\tapi_target_tokens\tapi_target_mae\tapi_target_mean_delta\tapi_top_items\tapi_top_mapped\tapi_top_coverage\tapi_top1_count\tapi_top1_match\tapi_top1_rate\tapi_topn_ref\tapi_topn_hit\tapi_topn_recall\tapi_top_logprob_count\tapi_top_mae\tapi_top_mean_delta\tapi_pair_total\tapi_pair_agree\tapi_pair_rate"
+HEADER = "id\tprompt_tokens\ttarget_tokens\tnll\tavg_nll\tfirst_match\tgreedy_lcp\tapi_ref_tokens\tapi_target_tokens\tapi_target_mae\tapi_target_mean_delta\tapi_top_items\tapi_top_mapped\tapi_top_coverage\tapi_top1_count\tapi_top1_match\tapi_top1_rate\tapi_topn_ref\tapi_topn_hit\tapi_topn_recall\tapi_top_logprob_count\tapi_top_mae\tapi_top_mean_delta\tapi_pair_total\tapi_pair_agree\tapi_pair_rate\tapi_overlap_positions\tapi_overlap\tapi_top_mass"
 ROWS = [
-    "case_000\t10\t4\t4.000000000\t1.000000000\t1\t2\t4\t4\t0.100000000\t-0.050000000\t8\t8\t1.000000000\t4\t3\t0.750000000\t8\t6\t0.750000000\t8\t0.300000000\t-0.100000000\t4\t3\t0.750000000",
-    "case_001\t12\t2\t4.000000000\t2.000000000\t0\t0\t2\t2\t0.400000000\t0.200000000\t6\t6\t1.000000000\t2\t1\t0.500000000\t6\t3\t0.500000000\t6\t0.600000000\t0.200000000\t6\t3\t0.500000000",
+    "case_000\t10\t4\t4.000000000\t1.000000000\t1\t2\t4\t4\t0.100000000\t-0.050000000\t8\t8\t1.000000000\t4\t3\t0.750000000\t8\t6\t0.750000000\t8\t0.300000000\t-0.100000000\t4\t3\t0.750000000\t4\t0.800000000\t0.990000000",
+    "case_001\t12\t2\t4.000000000\t2.000000000\t0\t0\t2\t2\t0.400000000\t0.200000000\t6\t6\t1.000000000\t2\t1\t0.500000000\t6\t3\t0.500000000\t6\t0.600000000\t0.200000000\t6\t3\t0.500000000\t2\t0.700000000\t0.980000000",
 ]
 MANIFEST = "# id\tprompt_file\tcontinuation_file\tresponse_file\ncase_000\tp0.txt\tc0.txt\tr0.json\ncase_001\tp1.txt\tc1.txt\tr1.json\n"
 
@@ -110,13 +110,18 @@ class ScoresTest(unittest.TestCase):
             with self.subTest(field=field):
                 self.reject(self.changed(**{field: "0"}))
 
+    def test_rejects_inconsistent_overlap(self):
+        self.reject(self.changed(api_overlap="0.995000000"), "api_overlap outside")
+        self.reject(self.changed(api_top_mass="1.000100000"), "api_top_mass exceeds 1")
+        self.reject(self.changed(api_overlap_positions="5"), "api_overlap_positions exceeds")
+
     def test_finite_looking_decimal_double_overflow_fails(self):
         self.reject(self.changed(nll="2" + "0" * 308 + ".000000000"), "not finite")
 
     def test_schema_truncation_and_trailing_junk(self):
         for text in ("", HEADER + "\n", self.valid[:-1], self.valid[:-8],
-                     self.valid.replace("\t0.750000000\n", "\n", 1),
-                     self.valid.replace("\t0.750000000\n", "\t0.750000000\textra\n", 1),
+                     self.valid.replace("\t0.990000000\n", "\n", 1),
+                     self.valid.replace("\t0.990000000\n", "\t0.990000000\textra\n", 1),
                      self.valid + "\n", self.valid + "# done\n", self.valid + "\x00\n",
                      self.valid.replace("\tnll\t", "\tavg_nll\t", 1),
                      self.valid.replace("\tnll\tavg_nll", "\tavg_nll\tnll", 1),

@@ -18,18 +18,19 @@ COLUMNS = (
     "api_ref_tokens api_target_tokens api_target_mae api_target_mean_delta "
     "api_top_items api_top_mapped api_top_coverage api_top1_count api_top1_match "
     "api_top1_rate api_topn_ref api_topn_hit api_topn_recall api_top_logprob_count "
-    "api_top_mae api_top_mean_delta api_pair_total api_pair_agree api_pair_rate"
+    "api_top_mae api_top_mean_delta api_pair_total api_pair_agree api_pair_rate "
+    "api_overlap_positions api_overlap api_top_mass"
 ).split()
 FLOAT_COLUMNS = {
     "nll", "avg_nll", "api_target_mae", "api_target_mean_delta",
     "api_top_coverage", "api_top1_rate", "api_topn_recall", "api_top_mae",
-    "api_top_mean_delta", "api_pair_rate",
+    "api_top_mean_delta", "api_pair_rate", "api_overlap", "api_top_mass",
 }
 COUNT_COLUMNS = set(COLUMNS[1:]) - FLOAT_COLUMNS
 DENOMINATORS = (
     "prompt_tokens", "target_tokens", "api_ref_tokens", "api_target_tokens",
     "api_top_items", "api_top_mapped", "api_top1_count", "api_topn_ref",
-    "api_top_logprob_count", "api_pair_total",
+    "api_top_logprob_count", "api_pair_total", "api_overlap_positions",
 )
 RATIOS = (
     ("api_top_coverage", "api_top_mapped", "api_top_items"),
@@ -39,6 +40,7 @@ RATIOS = (
 )
 MANIFEST_HEADER = "# id\tprompt_file\tcontinuation_file\tresponse_file"
 HALF_PRINT_UNIT = Decimal("0.0000000005")
+API_MASS_ROUNDING = Decimal("0.00001")
 MAX_COUNT = 2**63 - 1
 
 
@@ -128,6 +130,12 @@ def validate_row(row: dict[str, int | Decimal], where: str) -> None:
         require(mae >= 0, f"{where}: {prefix}_mae is negative")
         require(abs(signed) <= mae + 2 * HALF_PRINT_UNIT,
                 f"{where}: absolute signed delta exceeds MAE")
+    require(row["api_overlap_positions"] <= target, f"{where}: api_overlap_positions exceeds target_tokens")
+    require(0 <= row["api_overlap"] <= row["api_top_mass"] + HALF_PRINT_UNIT,
+            f"{where}: api_overlap outside [0, api_top_mass]")
+    # Hosted APIs round each alternative's logprob, so the summed mass can exceed
+    # one by a few 1e-7; allow that, not a genuinely inconsistent distribution.
+    require(row["api_top_mass"] <= 1 + API_MASS_ROUNDING, f"{where}: api_top_mass exceeds 1")
 
 
 def load_scores(path: Path, ids: tuple[str, ...]) -> tuple[dict, str]:
@@ -161,6 +169,9 @@ def aggregate(rows: dict, ids: tuple[str, ...]) -> dict:
         for suffix in ("mae", "mean_delta"):
             field = f"{prefix}_{suffix}"
             result[field] = sum(rows[i][field] * rows[i][denominator] for i in ids) / counts[denominator]
+    for field in ("api_overlap", "api_top_mass"):
+        result[field] = (sum(rows[i][field] * rows[i]["api_overlap_positions"] for i in ids)
+                         / counts["api_overlap_positions"])
     for field, numerator, denominator in RATIOS:
         result[field] = Decimal(counts[numerator]) / counts[denominator]
     return result

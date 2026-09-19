@@ -28,7 +28,7 @@ static void usage(const char *prog) {
             "[--ssd-streaming] [--ssd-streaming-cold] "
             "[--ssd-streaming-cache-experts N|NGB] "
             "[--ssd-streaming-preload-experts N] "
-            "[--dump-first-logits PATH] "
+            "[--dump-first-logits PATH] [--dump-trace PATH] "
             "[--max-cases N] "
             "[--continued-prefill N] "
             "[--session-batch N] "
@@ -140,6 +140,7 @@ typedef struct {
 
 typedef struct {
     double logprob;
+    bool empty_token;   /* "token": "" — an end-of-sequence marker, not text */
     api_alt *alts;
     int n_alts;
     int cap_alts;
@@ -168,6 +169,14 @@ typedef struct {
     long topn_hit;
     long pair_total;
     long pair_agree;
+
+    /* Expected speculative-decoding acceptance of the local model drafting
+     * for the API model: sum over mapped API alternatives of
+     * min(p_local, p_api) at each position (1 - truncated total variation).
+     * top_mass is the API probability mass covered by those alternatives. */
+    long overlap_positions;
+    double overlap_sum;
+    double top_mass_sum;
 } api_metrics;
 
 static const char *json_ws(const char *p) {
@@ -418,6 +427,10 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
         p++;
         if (strcmp(key, "logprob") == 0) {
             if (!json_number(&p, &pos->logprob)) return false;
+        } else if (strcmp(key, "token") == 0) {
+            p = json_ws(p);
+            if (p[0] == '"' && p[1] == '"') pos->empty_token = true;
+            p = json_skip_value(p);
         } else if (strcmp(key, "top_logprobs") == 0) {
             if (!api_parse_alt_array(&p, pos)) return false;
         } else {
@@ -457,6 +470,12 @@ static bool api_ref_parse(const char *json, api_ref *ref) {
     while (1) {
         p = json_ws(p);
         if (*p == ']') {
+            /* Some hosted endpoints append the stop token as an empty-string
+             * entry when the reply ends before max_tokens. It is not part of
+             * the continuation text, so it must not count as a position. */
+            while (ref->n_pos > 0 && ref->pos[ref->n_pos - 1].empty_token) {
+                api_pos_free(&ref->pos[--ref->n_pos]);
+            }
             return ref->n_pos > 0;
         }
         api_pos pos = {0};
@@ -602,6 +621,9 @@ static void api_metrics_accum(api_metrics *dst, const api_metrics *src) {
     dst->topn_hit += src->topn_hit;
     dst->pair_total += src->pair_total;
     dst->pair_agree += src->pair_agree;
+    dst->overlap_positions += src->overlap_positions;
+    dst->overlap_sum += src->overlap_sum;
+    dst->top_mass_sum += src->top_mass_sum;
 }
 
 static double safe_avg(double sum, long n) {
@@ -634,6 +656,7 @@ int main(int argc, char **argv) {
     uint64_t ssd_streaming_cache_bytes = 0;
     uint32_t ssd_streaming_preload_experts = 0;
     const char *first_logits_path = NULL;
+    FILE *trace = NULL;
     int max_cases = 0;
     int continued_prefill = 0;
     int session_count = 1;
@@ -690,6 +713,15 @@ int main(int argc, char **argv) {
                 (uint32_t)parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--dump-first-logits")) {
             first_logits_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-trace")) {
+            /* Per-position trace so metrics can be recomputed offline without
+             * rerunning the model: local logprob of the target token, the local
+             * greedy token, and the local logprob of every mapped API alternative
+             * (alt index j in the response's top_logprobs order; -1 = target). */
+            const char *path = need_arg(&i, argc, argv, arg);
+            trace = fopen(path, "w");
+            if (!trace) die("cannot open --dump-trace path");
+            fprintf(trace, "id\tpos\tkind\talt\ttoken\tlocal_logprob\tapi_logprob\tgreedy\n");
         } else if (!strcmp(arg, "--max-cases")) {
             max_cases = parse_positive_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--continued-prefill")) {
@@ -848,7 +880,8 @@ int main(int argc, char **argv) {
             "\tapi_top1_count\tapi_top1_match\tapi_top1_rate"
             "\tapi_topn_ref\tapi_topn_hit\tapi_topn_recall"
             "\tapi_top_logprob_count\tapi_top_mae\tapi_top_mean_delta"
-            "\tapi_pair_total\tapi_pair_agree\tapi_pair_rate\n");
+            "\tapi_pair_total\tapi_pair_agree\tapi_pair_rate"
+            "\tapi_overlap_positions\tapi_overlap\tapi_top_mass\n");
 
     char line[8192];
     int case_n = 0;
@@ -947,6 +980,11 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
+            if (trace) {
+                fprintf(trace, "%s\t%d\ttarget\t-1\t%d\t%.9g\t%.9g\t%d\n", id, i, target.v[i],
+                        local_logprob(logits, n_vocab, target.v[i], logsum),
+                        api_aligned && isfinite(ref.pos[i].logprob) ? ref.pos[i].logprob : NAN, greedy);
+            }
             if (i == 0) first_match = (greedy == target.v[i]);
             if (still_matching && greedy == target.v[i]) lcp++;
             else still_matching = false;
@@ -989,6 +1027,10 @@ int main(int argc, char **argv) {
                         if (tok < 0) continue;
                         const double lp = local_logprob(logits, n_vocab, tok, logsum);
                         if (!isfinite(lp)) continue;
+                        if (trace) {
+                            fprintf(trace, "%s\t%d\talt\t%d\t%d\t%.9g\t%.9g\t%d\n", id, i, j, tok, lp,
+                                    ap->alts[j].logprob, greedy);
+                        }
                         if (j == 0) {
                             cm.top1_count++;
                             if (tok == greedy) cm.top1_match++;
@@ -1007,6 +1049,21 @@ int main(int argc, char **argv) {
                             local_lp[mapped_n] = lp;
                             mapped_n++;
                         }
+                    }
+
+                    if (mapped_n > 0) {
+                        double overlap = 0.0, mass = 0.0;
+                        for (int a = 0; a < mapped_n; a++) {
+                            bool dup = false;
+                            for (int b = 0; b < a; b++) if (mapped_ids[b] == mapped_ids[a]) dup = true;
+                            if (dup) continue;
+                            const double pa = exp(api_lp[a]), pl = exp(local_lp[a]);
+                            overlap += pa < pl ? pa : pl;
+                            mass += pa;
+                        }
+                        cm.overlap_positions++;
+                        cm.overlap_sum += overlap;
+                        cm.top_mass_sum += mass;
                     }
 
                     for (int a = 0; a < mapped_n; a++) {
@@ -1037,7 +1094,8 @@ int main(int argc, char **argv) {
                 "\t%ld\t%ld\t%.9f"
                 "\t%ld\t%ld\t%.9f"
                 "\t%ld\t%.9f\t%.9f"
-                "\t%ld\t%ld\t%.9f\n",
+                "\t%ld\t%ld\t%.9f"
+                "\t%ld\t%.9f\t%.9f\n",
                 id, prompt.len, target.len, nll, avg, first_match ? 1 : 0, lcp,
                 have_api ? ref.n_pos : 0,
                 cm.target_count,
@@ -1057,7 +1115,10 @@ int main(int argc, char **argv) {
                 safe_avg(cm.top_signed_delta, cm.top_logprob_count),
                 cm.pair_total,
                 cm.pair_agree,
-                safe_ratio(cm.pair_agree, cm.pair_total));
+                safe_ratio(cm.pair_agree, cm.pair_total),
+                cm.overlap_positions,
+                safe_avg(cm.overlap_sum, cm.overlap_positions),
+                safe_avg(cm.top_mass_sum, cm.overlap_positions));
         fflush(out);
 
         case_n++;
@@ -1097,7 +1158,8 @@ int main(int argc, char **argv) {
             "target_mean_delta=%.9f top_items=%ld top_mapped=%ld "
             "top_coverage=%.9f top1_match=%ld/%ld top1_rate=%.9f "
             "topn_hit=%ld/%ld topn_recall=%.9f top_logprob_count=%ld "
-            "top_mae=%.9f top_mean_delta=%.9f pair_agree=%ld/%ld pair_rate=%.9f\n",
+            "top_mae=%.9f top_mean_delta=%.9f pair_agree=%ld/%ld pair_rate=%.9f "
+            "overlap=%.9f top_mass=%.9f positions=%ld\n",
             total_api_ref_tokens,
             total_api.target_count,
             safe_avg(total_api.target_abs_delta, total_api.target_count),
@@ -1116,8 +1178,12 @@ int main(int argc, char **argv) {
             safe_avg(total_api.top_signed_delta, total_api.top_logprob_count),
             total_api.pair_agree,
             total_api.pair_total,
-            safe_ratio(total_api.pair_agree, total_api.pair_total));
+            safe_ratio(total_api.pair_agree, total_api.pair_total),
+            safe_avg(total_api.overlap_sum, total_api.overlap_positions),
+            safe_avg(total_api.top_mass_sum, total_api.overlap_positions),
+            total_api.overlap_positions);
 
+    if (trace) fclose(trace);
     fclose(out);
     fclose(mf);
     free(logits);

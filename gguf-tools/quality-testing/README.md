@@ -289,6 +289,14 @@ Output fields:
   local top-N for the same position.
 - `api_top_mae`: local-vs-API logprob MAE over mapped API top alternatives.
 - `api_pair_rate`: pairwise ordering agreement among mapped API alternatives.
+- `api_overlap`: per position, `sum min(p_local, p_api)` over the mapped API
+  top alternatives, averaged over positions. This is the speculative-decoding
+  acceptance rate of the local model drafting for the API model, i.e.
+  `1 - total variation` restricted to the API's top list; 1.0 means identical
+  next-token distributions. `api_top_mass` is the API probability mass covered
+  by that list, so `1 - api_top_mass` bounds the truncation error. Both need
+  real logprobs (a temperature-1 fixture); they are meaningless on
+  temperature-0 fixtures whose logprobs are `0`/`-9999`.
 
 ## 6. Validate regression artifacts
 

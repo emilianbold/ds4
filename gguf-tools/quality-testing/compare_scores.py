@@ -89,6 +89,9 @@ def print_api_summary(label: str, rows: dict[str, dict[str, float | int]], ids: 
         f"{weighted_avg(rows, ids, 'api_top_mean_delta', 'api_top_logprob_count'):.9f}"
     )
     print(f"{label}_api_pair_rate\t{ratio(pair_agree, pair_total):.9f}")
+    if "api_overlap" in next(iter(rows.values())):
+        print(f"{label}_api_overlap\t{weighted_avg(rows, ids, 'api_overlap', 'api_overlap_positions'):.9f}")
+        print(f"{label}_api_top_mass\t{weighted_avg(rows, ids, 'api_top_mass', 'api_overlap_positions'):.9f}")
 
 
 def main() -> int:
