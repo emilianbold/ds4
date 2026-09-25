@@ -247,11 +247,11 @@ kernel void kernel_dsv4_qkv_rms_norm_f32_4(
 // FP8/raw finalizer were three back-to-back dispatches on the same rows.
 // The q threadgroup is byte-identical to kernel_dsv4_qkv_rms_norm_f32_4.
 // The kv threadgroup continues with the shared affine-row RoPE helper (lane
-// mapping preserved: r == lane on the first 64 lanes) and a verbatim copy of
-// kernel_dsv4_kv_fp8_store_f32 with its work predicated to the first 64
-// lanes (barriers stay uniform across the whole threadgroup).  Arithmetic,
-// order and rounding are unchanged; gated and verified against
-// full-vocabulary logits before promotion.
+// mapping preserved: r == lane on the first 64 lanes) and the original FP8
+// finalizer tree. The optional SIMD max schedule changes only the reduction
+// and lane assignment; scale, quantization and round-trip stay identical.
+constant bool FC_ds4_fp8_kv_simd_max [[function_constant(920)]];
+
 kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
         constant ds4_metal_args_qkv_rms_norm & args,
         constant ds4_metal_args_dsv4_rope_affine_pair & rope,
@@ -318,7 +318,7 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
         return;
     }
 
-    // KV RoPE tail in place, then the FP8/raw finalizer (verbatim bodies).
+    // KV RoPE tail in place, then the FP8/raw finalizer.
     threadgroup_barrier(mem_flags::mem_device_and_threadgroup);
 
     device char *kv_row = (device char *)(kv_dst + row * row_stride4);
@@ -348,12 +348,42 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
     device float *raw = raw_cache + (int64_t)store.raw_row * head_dim;
     threadgroup float *scratch = shmem_f32 + 32;
 
+    if (FC_ds4_fp8_kv_simd_max) {
+        // A SIMD group owns one 64-value chunk; each lane owns two stores.
+        // The RoPE producer barrier above covers all groups before these loads.
+        for (int off = (int)sgitg * 64; off < n_nope; off += (int)ntg.x * 2) {
+            const int i0 = off + (int)tiisg;
+            const int i1 = i0 + 32;
+            const float v0 = i0 < n_nope ? kv[i0] : 0.0f;
+            const float v1 = i1 < n_nope ? kv[i1] : 0.0f;
+            const float amax = max(simd_max(max(abs(v0), abs(v1))), 1.0e-4f);
+            const float fp8_scale = exp2(ceil(log2(amax / 448.0f)));
+            if (i0 < n_nope) {
+                const float q = dsv4_e4m3fn_dequant(clamp(v0 / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
+                kv[i0] = q;
+#ifdef DS4_METAL_KV_RAW_F32
+                raw[i0] = q;
+#else
+                raw[i0] = (float)((half)q);
+#endif
+            }
+            if (i1 < n_nope) {
+                const float q = dsv4_e4m3fn_dequant(clamp(v1 / fp8_scale, -448.0f, 448.0f)) * fp8_scale;
+                kv[i1] = q;
+#ifdef DS4_METAL_KV_RAW_F32
+                raw[i1] = q;
+#else
+                raw[i1] = (float)((half)q);
+#endif
+            }
+        }
+    } else {
     for (int off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
         if (tid < 64u && off + (int)tid < n_nope) {
             v = kv[off + tid];
-            scratch[tid] = abs(v);
         }
+        if (tid < 64u) scratch[tid] = abs(v);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (uint stride = 32; stride > 0; stride >>= 1) {
@@ -375,6 +405,7 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
 #endif
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     }
 
     if (tid < 64u) {

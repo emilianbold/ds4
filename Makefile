@@ -239,6 +239,13 @@ tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
 
+tests/test_fp8_kv_max: tests/test_fp8_kv_max.c ds4_gpu.h $(CORE_OBJS)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
+
+.PHONY: test-fp8-kv-max
+test-fp8-kv-max: tests/test_fp8_kv_max
+	./tests/test_fp8_kv_max
+
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1071,6 +1078,7 @@ clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
+	rm -f tests/test_fp8_kv_max
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_reductions

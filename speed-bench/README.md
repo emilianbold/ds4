@@ -54,6 +54,19 @@ legacy decode path, including token selection, use:
   --tokens 1024
 ```
 
+To compare the optional SIMD-group FP8 KV max reduction in the fused decode
+norm/RoPE/store finalizer against its original tree on one Metal engine, run
+`make test-fp8-kv-max` and then:
+
+```
+./speed-bench/metal_decode_schedule_bench -m /path/to/flash-0731.gguf \
+  --candidate-env DS4_METAL_FP8_KV_SIMD_MAX --include-selection --tokens 512
+```
+
+The standalone 64-thread FP8 finalizers are not affected. Setting
+`DS4_METAL_FP8_KV_SIMD_MAX=1` for a normal model run selects the SIMD schedule;
+without it the original tree remains the default.
+
 ### Metal prefill variant A/B
 
 Build the balanced prefill comparison. To compare the default resident pre-M5
