@@ -2646,26 +2646,9 @@ static id<MTLComputePipelineState> ds4_gpu_get_pipeline(
 /* Dispatch-time switch for the fused FP8 max schedule; absent means the
  * original tree, allowing same-engine bitwise and throughput comparisons. */
 static id<MTLComputePipelineState> ds4_gpu_get_fp8_kv_max_pipeline(void) {
-    const char *name = "kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32";
-    bool enabled = getenv("DS4_METAL_FP8_KV_SIMD_MAX") != NULL;
-    NSString *key = enabled
-        ? @"kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_simd_max"
-        : @"kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_tree";
-    id<MTLComputePipelineState> pipeline = [g_pipeline_cache objectForKey:key];
-    if (pipeline) return pipeline == (id<MTLComputePipelineState>)[NSNull null] ? nil : pipeline;
-
-    MTLFunctionConstantValues *constants = [[MTLFunctionConstantValues alloc] init];
-    [constants setConstantValue:&enabled type:MTLDataTypeBool atIndex:920];
-    NSError *error = nil;
-    id<MTLFunction> fn = [g_library newFunctionWithName:[NSString stringWithUTF8String:name]
-                                         constantValues:constants error:&error];
-    if (fn) pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
-    if (!pipeline) {
-        fprintf(stderr, "ds4: Metal FP8 KV SIMD max pipeline failed: %s\n",
-                [[error localizedDescription] UTF8String]);
-    }
-    [g_pipeline_cache setObject:pipeline ?: (id<MTLComputePipelineState>)[NSNull null] forKey:key];
-    return pipeline;
+    return ds4_gpu_get_pipeline(getenv("DS4_METAL_FP8_KV_SIMD_MAX") ?
+        "kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_simd_max" :
+        "kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32");
 }
 
 static int ds4_gpu_disable_hot_pipeline_statics(void) {

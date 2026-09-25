@@ -250,9 +250,8 @@ kernel void kernel_dsv4_qkv_rms_norm_f32_4(
 // mapping preserved: r == lane on the first 64 lanes) and the original FP8
 // finalizer tree. The optional SIMD max schedule changes only the reduction
 // and lane assignment; scale, quantization and round-trip stay identical.
-constant bool FC_ds4_fp8_kv_simd_max [[function_constant(920)]];
-
-kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
+template <bool SIMD_MAX>
+kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_impl(
         constant ds4_metal_args_qkv_rms_norm & args,
         constant ds4_metal_args_dsv4_rope_affine_pair & rope,
         constant ds4_metal_args_dsv4_kv_fp8_store & store,
@@ -348,7 +347,7 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
     device float *raw = raw_cache + (int64_t)store.raw_row * head_dim;
     threadgroup float *scratch = shmem_f32 + 32;
 
-    if (FC_ds4_fp8_kv_simd_max) {
+    if (SIMD_MAX) {
         // A SIMD group owns one 64-value chunk; each lane owns two stores.
         // The RoPE producer barrier above covers all groups before these loads.
         for (int off = (int)sgitg * 64; off < n_nope; off += (int)ntg.x * 2) {
@@ -418,3 +417,14 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
         }
     }
 }
+
+typedef decltype(kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_impl<false>)
+        dsv4_qkv_rms_norm_kv_rope_fp8_store_t;
+
+template [[host_name("kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32")]]
+kernel dsv4_qkv_rms_norm_kv_rope_fp8_store_t
+kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_impl<false>;
+
+template [[host_name("kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_simd_max")]]
+kernel dsv4_qkv_rms_norm_kv_rope_fp8_store_t
+kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32_impl<true>;
