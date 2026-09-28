@@ -389,6 +389,7 @@ static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f32_f16_pipeline;
+static id<MTLComputePipelineState> g_causal_comp_mask_pipeline;
 static id<MTLComputePipelineState> g_cpy_contig_f32_f16_pipeline;
 static id<MTLComputePipelineState> g_cpy_f16_f32_pipeline;
 static id<MTLComputePipelineState> g_cpy_f16_f16_pipeline;
@@ -4934,6 +4935,14 @@ typedef struct {
     uint64_t nb3;
 } ds4_gpu_cpy_args;
 
+typedef struct {
+    uint32_t n_comp;
+    uint32_t n_tokens;
+    uint32_t pos0;
+    uint32_t ratio;
+    uint32_t n_keys;
+} ds4_gpu_causal_comp_mask_args;
+
 static ds4_gpu_cpy_args ds4_gpu_make_cpy_1d_args(
         uint32_t n,
         uint64_t src_elem,
@@ -7134,6 +7143,23 @@ int ds4_gpu_init(void) {
         g_cpy_f32_f16_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_cpy_f32_f16_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_cpy_f32_f16 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        fn = [library newFunctionWithName:@"kernel_dsv4_causal_comp_mask"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_causal_comp_mask function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_causal_comp_mask_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_causal_comp_mask_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_dsv4_causal_comp_mask pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -11583,6 +11609,7 @@ void ds4_gpu_cleanup(void) {
         g_concat_pipeline = nil;
         g_cpy_f32_f32_pipeline = nil;
         g_cpy_f32_f16_pipeline = nil;
+        g_causal_comp_mask_pipeline = nil;
         g_cpy_contig_f32_f16_pipeline = nil;
         g_cpy_f16_f32_pipeline = nil;
         g_cpy_f16_f16_pipeline = nil;
@@ -27275,6 +27302,47 @@ static int ds4_gpu_encode_cpy_f32_f16_2d(
     return 1;
 }
 
+/* Copy the per-token compressed-key selection mask into the batch attention
+ * mask while retaining causal visibility: a compressed key is visible only
+ * when it is both selected and below the query's causal frontier
+ * (pos0 + row + 1) / ratio. Top-k may select -inf-scored future rows when
+ * fewer than top_k causal keys exist, so selection must never replace causal
+ * visibility. Raw image keys keep their bidirectional visibility untouched. */
+static int ds4_gpu_encode_causal_comp_mask(
+        id<MTLCommandBuffer> cb,
+        id<MTLBuffer>        src,
+        NSUInteger           src_off,
+        id<MTLBuffer>        dst,
+        NSUInteger           dst_off,
+        uint32_t             cols,
+        uint32_t             rows,
+        uint32_t             pos0,
+        uint32_t             ratio,
+        uint32_t             n_keys) {
+    if (!cb || !src || !dst || cols == 0 || rows == 0 || ratio == 0) return 0;
+
+    ds4_gpu_causal_comp_mask_args args = {
+        .n_comp = cols,
+        .n_tokens = rows,
+        .pos0 = pos0,
+        .ratio = ratio,
+        .n_keys = n_keys,
+    };
+    const NSUInteger nth = ds4_gpu_cpy_threads(cols, g_causal_comp_mask_pipeline);
+    const NSUInteger col_groups = ((NSUInteger)cols + nth - 1u) / nth;
+
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+    [enc setComputePipelineState:g_causal_comp_mask_pipeline];
+    [enc setBytes:&args length:sizeof(args) atIndex:0];
+    [enc setBuffer:src offset:src_off atIndex:1];
+    [enc setBuffer:dst offset:dst_off atIndex:2];
+    [enc dispatchThreadgroups:MTLSizeMake(col_groups, rows, 1)
+         threadsPerThreadgroup:MTLSizeMake(nth, 1, 1)];
+    ds4_gpu_end_compute_encoder(cb, enc);
+
+    return 1;
+}
+
 static int ds4_gpu_encode_cpy_f32_f16_3d(
         id<MTLCommandBuffer> cb,
         id<MTLBuffer>        src,
@@ -30036,15 +30104,16 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                                ratio);
     }
     if (use_comp_mask) {
-        if (!ds4_gpu_encode_cpy_f32_f16_2d(cb,
-                                             maskbuf,
-                                             ds4_gpu_tensor_offset(comp_mask),
-                                             mask_buffer,
-                                             (NSUInteger)n_raw * sizeof(uint16_t),
-                                             n_comp,
-                                             n_tokens,
-                                             (uint64_t)n_comp * sizeof(float),
-                                             (uint64_t)n_keys * sizeof(uint16_t))) {
+        if (!ds4_gpu_encode_causal_comp_mask(cb,
+                                                maskbuf,
+                                                ds4_gpu_tensor_offset(comp_mask),
+                                                mask_buffer,
+                                                (NSUInteger)n_raw * sizeof(uint16_t),
+                                                n_comp,
+                                                n_tokens,
+                                                pos0,
+                                                ratio,
+                                                n_keys)) {
             return 0;
         }
     }
