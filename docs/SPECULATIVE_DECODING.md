@@ -45,6 +45,29 @@ Recorded comparisons are in [the QA guide](../QA_BEFORE_RELEASES.md).
 
 For the tested Strix Halo coding configuration, use `--dspark --dspark-confidence 0.7` with the default five-token draft cap and scheduler. Client sampling is temperature `1.0`, `top_p=0.95`, `min_p=0`, and `top_k=0`; high reasoning was also checked on coding and tool-use requests. This uses opportunistic sampling as described below; exact-mode throughput is not qualified by these measurements. `--mtp-draft` controls legacy autoregressive MTP, not the DSpark draft width.
 
+## DeepSeek Flash: context n-gram drafting
+
+`--ngram-spec N` drafts up to `N` tokens per cycle without any support
+model: the drafter finds the most recent earlier occurrence of the last few
+context tokens and proposes the tokens that followed it (prompt-lookup
+decoding). The table is the live prompt plus generated tokens, rescanned
+each cycle, and the DSpark batched verifier and back-off scheduler check the
+proposal, so acceptance is lossless: a draft token survives only where the
+target model's own greedy continuation agrees.
+
+```sh
+./ds4 --ngram-spec 5
+```
+
+Gains depend on repetition: code completion, lists, and echoed structure
+accept well; sparse prose stays near neutral, and the scheduler backs off
+when drafting is unproductive. The same flag works in `ds4-bench` and
+`ds4-agent`, and greedy server requests pick it up automatically.
+Non-zero temperature ignores the drafter (v1 is greedy only).
+`DS4_NGRAM_SPEC_SIZE` overrides the match length (default 3), and
+`DS4_DSPARK_STATS=1` prints acceptance counters. It cannot be combined
+with DSpark/MTP support models.
+
 ## GLM: built-in MTP
 
 GLM's draft block is already in its main GGUF:

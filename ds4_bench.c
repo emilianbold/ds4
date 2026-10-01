@@ -73,6 +73,7 @@ typedef struct {
     bool dspark;
     bool dspark_confidence_threshold_set;
     float dspark_confidence_threshold;
+    int ngram_spec_draft_tokens;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -281,6 +282,13 @@ static bench_config parse_options(int argc, char **argv) {
             c.dspark = true;
             c.dspark_confidence_threshold = (float)v;
             c.dspark_confidence_threshold_set = true;
+        } else if (!strcmp(arg, "--ngram-spec")) {
+            const int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v < 2 || v > 16) {
+                fprintf(stderr, "ds4-bench: --ngram-spec must be between 2 and 16\n");
+                exit(2);
+            }
+            c.ngram_spec_draft_tokens = v;
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -388,6 +396,16 @@ static bench_config parse_options(int argc, char **argv) {
     }
     if (c.dspark && !c.mtp_path) {
         fprintf(stderr, "ds4-bench: --dspark requires --mtp-model FILE\n");
+        exit(2);
+    }
+    if (c.ngram_spec_draft_tokens > 1 && (c.dspark || c.mtp_path)) {
+        fprintf(stderr, "ds4-bench: --ngram-spec cannot be combined with --dspark or --mtp-model\n");
+        exit(2);
+    }
+    if (c.ngram_spec_draft_tokens > 1 && c.teacher_forced_decode) {
+        fprintf(stderr,
+                "ds4-bench: --ngram-spec cannot be combined with "
+                "--teacher-forced-decode\n");
         exit(2);
     }
     if (c.dspark && c.teacher_forced_decode) {
@@ -663,6 +681,7 @@ int main(int argc, char **argv) {
         .dspark = cfg.dspark,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
+        .ngram_spec_draft_tokens = cfg.ngram_spec_draft_tokens,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
@@ -786,9 +805,13 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
-    if (cfg.dspark && !speculative) {
-        fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
+    const bool ngram_spec = cfg.ngram_spec_draft_tokens > 1;
+    const bool speculative =
+        (cfg.dspark || ngram_spec) && ds4_engine_mtp_draft_tokens(engine) > 1;
+    if ((cfg.dspark || ngram_spec) && !speculative) {
+        fprintf(stderr,
+                "ds4-bench: %s did not enable speculative decoding\n",
+                ngram_spec ? "n-gram drafting" : "DSpark support model");
         if (out != stdout) fclose(out);
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
@@ -797,7 +820,8 @@ int main(int argc, char **argv) {
     }
     if (speculative) {
         fprintf(stderr,
-                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
+                "ds4-bench: %s enabled with draft width %d; frontier restoration uses session snapshots\n",
+                ngram_spec ? "n-gram drafting" : "DSpark",
                 ds4_engine_mtp_draft_tokens(engine));
     }
     ds4_session_snapshot snap = {0};
@@ -938,12 +962,12 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (ntok < 0) {
-                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n", frontier, err);
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d failed: %s\n", frontier, err);
                     rc = 1;
                     break;
                 }
                 if (ntok == 0) {
-                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d accepted no tokens\n", frontier);
+                    fprintf(stderr, "ds4-bench: speculative decode at frontier %d accepted no tokens\n", frontier);
                     rc = 1;
                     break;
                 }

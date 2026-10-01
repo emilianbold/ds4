@@ -137,6 +137,9 @@ typedef struct {
     int context_size;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
+    /* --ngram-spec N: propose up to N tokens per cycle by looking up the
+     * session context itself (prompt-lookup drafting). 0 disables. */
+    int ngram_spec_draft_tokens;
     float mtp_margin;
     float dspark_confidence_threshold;
     const char *directional_steering_file;

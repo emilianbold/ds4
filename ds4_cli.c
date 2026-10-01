@@ -2039,6 +2039,13 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
+        } else if (!strcmp(arg, "--ngram-spec")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v < 2 || v > 16) {
+                fprintf(stderr, "ds4: --ngram-spec must be between 2 and 16\n");
+                exit(2);
+            }
+            c.engine.ngram_spec_draft_tokens = v;
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
