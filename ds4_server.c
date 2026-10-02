@@ -15647,6 +15647,13 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--dspark-strict")) {
             c.engine.dspark = true;
             c.engine.dspark_strict = true;
+        } else if (!strcmp(arg, "--ngram-spec")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 2 || v > 16) {
+                fprintf(stderr, "ds4-server: --ngram-spec must be between 2 and 16\n");
+                exit(2);
+            }
+            c.engine.ngram_spec_draft_tokens = v;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
