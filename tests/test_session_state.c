@@ -417,6 +417,33 @@ static void test_dspark_rollback_misses(void) {
     ds4_session_free(s);
 }
 
+static void test_dspark_rollback_eligibility(void) {
+    ds4_engine e = {.backend = DS4_BACKEND_METAL};
+    ds4_session *s = calloc(1, sizeof(*s));
+    assert(s);
+    s->engine = &e;
+    assert(ds4_session_dspark_rollback_eligible(s));
+    /* An image-conditioned session keeps the snapshot fast path.  Without it a
+     * rewind inside a committed block drops the whole checkpoint and the next
+     * request re-prefills the conversation. */
+    ds4_vision_identity image = {.token_start = 8, .token_count = 4};
+    s->checkpoint_images = &image;
+    s->checkpoint_image_count = 1;
+    assert(ds4_session_dspark_rollback_eligible(s));
+    s->checkpoint_images = NULL;
+    s->checkpoint_image_count = 0;
+    /* The unsupported backends and session shapes stay excluded. */
+    e.tp.active = true;
+    assert(!ds4_session_dspark_rollback_eligible(s));
+    e.tp.active = false;
+    e.ssd_streaming = true;
+    assert(!ds4_session_dspark_rollback_eligible(s));
+    e.ssd_streaming = false;
+    e.backend = DS4_BACKEND_CPU;
+    assert(!ds4_session_dspark_rollback_eligible(s));
+    ds4_session_free(s);
+}
+
 static void test_dspark_rollback_replay_fits(void) {
     assert(dspark_rollback_replay_fits(0, 1, 0, 1));
     assert(!dspark_rollback_replay_fits(0, 2, 0, 1));
@@ -548,6 +575,7 @@ int main(void) {
     test_text_observations();
 #ifndef DS4_NO_GPU
     test_dspark_rollback_misses();
+    test_dspark_rollback_eligibility();
     test_dspark_rollback_replay_fits();
     test_glm_attention_budget();
     test_glm_spec_rollback();
