@@ -61260,13 +61260,25 @@ static bool ds4_session_is_qwen4(const ds4_session *s) {
 
 #ifndef DS4_NO_GPU
 /* Shared by the DSpark rollback arm and rewind-consume sites so the
- * eligibility predicates cannot drift between them. */
+ * eligibility predicates cannot drift between them.
+ *
+ * Image-conditioned sessions qualify.  The snapshot is armed during decode, so
+ * its frontier is always past the last image row, and the rewind target is at
+ * or after that frontier.  A new sync -- the only way a session acquires an
+ * image span -- expires the handle first (ds4_session_sync_internal and the
+ * eval entry points all call ds4_session_dspark_rollback_invalidate), so
+ * restoring the snapshot and replaying the retained tail never rewinds across
+ * an image.
+ *
+ * Excluding them left those sessions with no restorable frontier at all: a
+ * rewind inside a committed block then dropped the whole checkpoint, and the
+ * next request reported common=0 with vision=mismatch and re-prefilled the
+ * conversation instead of continuing from live KV. */
 static bool ds4_session_dspark_rollback_eligible(const ds4_session *s) {
     const ds4_engine *e = s ? s->engine : NULL;
     return e && e->backend == DS4_BACKEND_METAL && !e->tp.active &&
            !e->ssd_streaming && !s->distributed &&
-           !ds4_session_is_glm(s) && !ds4_session_is_qwen4(s) &&
-           !ds4_session_has_vision_state(s);
+           !ds4_session_is_glm(s) && !ds4_session_is_qwen4(s);
 }
 
 /* Replay from the frontier reads raw rows [start - raw_window, len); they
@@ -85205,6 +85217,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos))
             s->checkpoint_valid = false;
     }
+    const int frontier_before = s->checkpoint.len;
     bool state_ok = false;
 #ifndef DS4_NO_GPU
 #ifdef DS4_HAS_QWEN4_GPU
@@ -85262,7 +85275,24 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->checkpoint.len = pos;
     /* DeepSeek compressors cannot be rolled back by truncating their row
      * counts. Without a saved frontier the caller must rebuild this prefix. */
-    if (!state_ok) s->checkpoint_valid = false;
+    if (!state_ok) {
+        /* The token prefix stays, but !checkpoint_valid makes the next
+         * request's prefix probe answer 0 and rebuild the whole conversation.
+         * That cost is invisible otherwise, so name it and the reason. */
+#ifndef DS4_NO_GPU
+        ds4_log(stderr, DS4_LOG_KVCACHE,
+                "ds4: rewind dropped the live checkpoint pos=%d vision=%d dspark_rollback=%d handle=%d..%d frontier=%d\n",
+                pos, ds4_session_has_vision_state(s),
+                ds4_session_dspark_rollback_eligible(s),
+                s->dspark_rollback_start, s->dspark_rollback_end,
+                frontier_before);
+#else
+        ds4_log(stderr, DS4_LOG_KVCACHE,
+                "ds4: rewind dropped the live checkpoint pos=%d vision=%d frontier=%d\n",
+                pos, ds4_session_has_vision_state(s), frontier_before);
+#endif
+        s->checkpoint_valid = false;
+    }
     s->mtp_draft_valid = false;
     ds4_session_dspark_capture_invalidate(s);
 #ifndef DS4_NO_GPU
