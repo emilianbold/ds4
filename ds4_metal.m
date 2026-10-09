@@ -20957,6 +20957,156 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
     return 1;
 }
 
+/*
+ * F16 dense matmul: one named function per implementation, selected by
+ * the priority ladder in ds4_gpu_matmul_f16_tensor_impl().  A tier
+ * returns 1 when it encoded and finished, 0 when it declined (only the
+ * accelerated Metal-4 prefill tier can decline: pipeline unavailable),
+ * and -1 on a hard error.  All tiers bind their buffers through the
+ * shared ds4_f16_mm_emit() plumbing.
+ */
+typedef struct {
+    id<MTLCommandBuffer> cb;
+    int cb_owned;
+    id<MTLBuffer> wbuf;
+    uint64_t w_offset;
+    id<MTLBuffer> xbuf;
+    uint64_t x_offset;
+    id<MTLBuffer> outbuf;
+    uint64_t out_offset;
+    uint32_t in_dim;
+    uint32_t out_dim;
+    uint32_t n_tok;
+    uint64_t row_bytes;
+} ds4_f16_mm_ctx;
+
+/* Bind pipeline/buffers/grid, end the encoder, finish the command buffer. */
+static int ds4_f16_mm_emit(const ds4_f16_mm_ctx *c,
+                           id<MTLComputePipelineState> pipeline,
+                           const void *args, NSUInteger args_len,
+                           NSUInteger smem,
+                           MTLSize threadgroups, MTLSize threads_per_tg,
+                           const char *finish_label) {
+    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(c->cb);
+    [enc setComputePipelineState:pipeline];
+    [enc setBytes:args length:args_len atIndex:0];
+    [enc setBuffer:c->wbuf offset:(NSUInteger)c->w_offset atIndex:1];
+    [enc setBuffer:c->xbuf offset:(NSUInteger)c->x_offset atIndex:2];
+    [enc setBuffer:c->outbuf offset:(NSUInteger)c->out_offset atIndex:3];
+    if (smem) {
+        [enc setThreadgroupMemoryLength:smem atIndex:0];
+    }
+    [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_tg];
+    ds4_gpu_end_compute_encoder(c->cb, enc);
+    return ds4_gpu_finish_command_buffer(c->cb, c->cb_owned, finish_label) ? 1 : -1;
+}
+
+/* Exact-rows / single-token matvec. */
+static int ds4_f16_mm_matvec(const ds4_f16_mm_ctx *c) {
+    ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(c->in_dim, c->out_dim);
+    mv_args.ne11 = mv_args.ne1 = (int32_t)c->n_tok;
+    mv_args.nb12 = mv_args.nb13 = (uint64_t)c->n_tok * c->in_dim * sizeof(float);
+    ds4_gpu_mv_dispatch mv_dispatch = ds4_gpu_make_plain_mv_dispatch(c->in_dim, 0);
+    if (!g_quality_mode && (c->out_dim == 512u || c->out_dim == 1024u) && c->in_dim >= 4096u) {
+        mv_dispatch.nr0 = 4;
+        mv_dispatch.smem = 32u * 4u * sizeof(float);
+    }
+    /* One row per SIMD group doubles the threadgroup count of narrow
+     * projections; every row keeps its K walk and reduction tree. */
+    if (ds4_gpu_plain_mv_single_row(c->out_dim)) {
+        mv_dispatch.nr0 = 1;
+        mv_dispatch.smem = 32u * sizeof(float);
+    }
+    mv_args.nr0 = mv_dispatch.nr0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
+    if (!pipeline) return -1;
+
+    return ds4_f16_mm_emit(c, pipeline, &mv_args, sizeof(mv_args), mv_dispatch.smem,
+                           MTLSizeMake(((NSUInteger)c->out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
+                                       (NSUInteger)c->n_tok,
+                                       1),
+                           MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1),
+                           "F16 tensor matvec");
+}
+
+/* Extended row matvec for the few-token batch sizes. */
+static int ds4_f16_mm_mv_ext(const ds4_f16_mm_ctx *c) {
+    const int16_t nsg = ds4_gpu_mv_ext_nsg();
+    const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(c->in_dim, c->n_tok);
+    const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(c->n_tok);
+    const char *fn_name = ds4_gpu_mv_ext_name(0, r1ptg);
+    id<MTLComputePipelineState> pipeline =
+        fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
+    if (!pipeline) return -1;
+
+    const int16_t nypsg = 32 / nxpsg;
+    const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
+    ds4_gpu_mul_mv_ext_args args =
+        ds4_gpu_make_mv_ext_args(c->in_dim, c->out_dim, c->n_tok, sizeof(uint16_t), c->row_bytes);
+
+    return ds4_f16_mm_emit(c, pipeline, &args, sizeof(args), 0,
+                          MTLSizeMake(((NSUInteger)c->out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
+                                      ((NSUInteger)c->n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
+                                      1),
+                          MTLSizeMake(32, (NSUInteger)nsg, 1),
+                          "F16 tensor mul_mv_ext");
+}
+
+/*
+ * Same direct-RHS TensorOps structure as Q8_0, but for F16 model
+ * matrices.  The 128-token RHS tile is kept when the batch alignment
+ * allows it because the later tile_n=64 retest was neutral/slower.
+ * Declines when the accelerated pipeline is unavailable.
+ */
+static int ds4_f16_mm_nax(const ds4_f16_mm_ctx *c) {
+    uint64_t nax_tile_n = 32u;
+    if ((c->n_tok % 128u) == 0) {
+        nax_tile_n = 128u;
+    } else if ((c->n_tok % 64u) == 0) {
+        nax_tile_n = 64u;
+    }
+    const char *nax_fn = nax_tile_n == 128u
+        ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128"
+        : (nax_tile_n == 64u
+            ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n64"
+            : "kernel_mul_mm_f16_f32_mpp_direct_rhs");
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
+    if (!pipeline) {
+        ds4_gpu_warn_mpp_fallback();
+        return 0;
+    }
+    ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(c->in_dim, c->out_dim, c->n_tok, c->row_bytes);
+
+    return ds4_f16_mm_emit(c, pipeline, &args, sizeof(args),
+                           2u * 64u * 32u * sizeof(uint16_t),
+                           MTLSizeMake((NSUInteger)(c->n_tok / nax_tile_n),
+                                       (NSUInteger)c->out_dim / 64u,
+                                       1),
+                           MTLSizeMake(128, 1, 1),
+                           "F16 NAX tensor matmul");
+}
+
+/* Legacy mul_mm catch-all with alignment function constants. */
+static int ds4_f16_mm_mul_mm(const ds4_f16_mm_ctx *c) {
+    const bool bc_inp = (c->in_dim % 32u) != 0;
+    const bool bc_out = (c->out_dim % 64u) != 0 || (c->n_tok % 32u) != 0;
+    id<MTLComputePipelineState> pipeline =
+        ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
+    if (!pipeline) return -1;
+
+    ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(c->in_dim, c->out_dim, c->n_tok, c->row_bytes);
+
+    return ds4_f16_mm_emit(c, pipeline, &args, sizeof(args),
+                           bc_out ? 8192u : 6144u,
+                           MTLSizeMake(((NSUInteger)c->n_tok + 31u) / 32u,
+                                       ((NSUInteger)c->out_dim + 63u) / 64u,
+                                       1),
+                           MTLSizeMake(128, 1, 1),
+                           "F16 tensor matmul");
+}
+
 static int ds4_gpu_matmul_f16_tensor_impl(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -21002,148 +21152,34 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1 || exact_rows) {
-            ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
-            mv_args.ne11 = mv_args.ne1 = (int32_t)n_tok;
-            mv_args.nb12 = mv_args.nb13 = n_tok * in_dim * sizeof(float);
-            ds4_gpu_mv_dispatch mv_dispatch =
-                ds4_gpu_make_plain_mv_dispatch(in_dim, 0);
-            if (!g_quality_mode && (out_dim == 512u || out_dim == 1024u) && in_dim >= 4096u) {
-                mv_dispatch.nr0 = 4;
-                mv_dispatch.smem = 32u * 4u * sizeof(float);
-            }
-            /* One row per SIMD group doubles the threadgroup count of narrow
-             * projections; every row keeps its K walk and reduction tree. */
-            if (ds4_gpu_plain_mv_single_row(out_dim)) {
-                mv_dispatch.nr0 = 1;
-                mv_dispatch.smem = 32u * sizeof(float);
-            }
-            mv_args.nr0 = mv_dispatch.nr0;
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mv_pipeline(mv_dispatch.function_name, mv_dispatch.nsg);
-            if (!pipeline) return 0;
+        ds4_f16_mm_ctx c = {
+            .cb = cb, .cb_owned = owned,
+            .wbuf = wbuf, .w_offset = inner_offset,
+            .xbuf = xbuf, .x_offset = ds4_gpu_tensor_offset(x),
+            .outbuf = outbuf, .out_offset = ds4_gpu_tensor_offset(out),
+            .in_dim = (uint32_t)in_dim, .out_dim = (uint32_t)out_dim,
+            .n_tok = (uint32_t)n_tok, .row_bytes = row_bytes,
+        };
 
-            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
-            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            if (mv_dispatch.smem) {
-                [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+        /* Priority ladder: the conditions stay here, in plain sight,
+         * in the order the old if-chain applied them.  A tier that
+         * errors or declines falls out exactly as the chain did. */
+        int rc;
+        if (exact_rows || n_tok == 1) {
+            rc = ds4_f16_mm_matvec(&c);
+        } else if (n_tok <= 8 && (in_dim % 128u) == 0) {
+            rc = ds4_f16_mm_mv_ext(&c);
+        } else {
+            rc = 0;
+            if (ds4_gpu_mpp_available() && n_tok >= 32u &&
+                (in_dim % 32u) == 0 && (out_dim % 64u) == 0 &&
+                (n_tok % 32u) == 0) {
+                rc = ds4_f16_mm_nax(&c);
             }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) / (NSUInteger)mv_dispatch.nr0,
-                                                  (NSUInteger)n_tok,
-                                                  1)
-                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
-
-            if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor matvec")) return 0;
-            return 1;
+            if (rc == 0) rc = ds4_f16_mm_mul_mm(&c);
         }
-
-        if (n_tok <= 8 && (in_dim % 128u) == 0) {
-            const int16_t nsg = ds4_gpu_mv_ext_nsg();
-            const int16_t nxpsg = ds4_gpu_mv_ext_nxpsg(in_dim, n_tok);
-            const int16_t r1ptg = ds4_gpu_mv_ext_r1ptg(n_tok);
-            const char *fn_name = ds4_gpu_mv_ext_name(0, r1ptg);
-            id<MTLComputePipelineState> pipeline =
-                fn_name ? ds4_gpu_get_mul_mv_ext_pipeline(fn_name, nsg, nxpsg) : nil;
-            if (!pipeline) return 0;
-
-            const int16_t nypsg = 32 / nxpsg;
-            const uint64_t r0ptg = (uint64_t)nypsg * (uint64_t)nsg;
-            ds4_gpu_mul_mv_ext_args args =
-                ds4_gpu_make_mv_ext_args(in_dim, out_dim, n_tok, sizeof(uint16_t), row_bytes);
-
-            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-            [enc setComputePipelineState:pipeline];
-            [enc setBytes:&args length:sizeof(args) atIndex:0];
-            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)r0ptg - 1u) / (NSUInteger)r0ptg,
-                                                  ((NSUInteger)n_tok + (NSUInteger)r1ptg - 1u) / (NSUInteger)r1ptg,
-                                                  1)
-                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)nsg, 1)];
-            ds4_gpu_end_compute_encoder(cb, enc);
-
-            if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor mul_mv_ext")) return 0;
-            return 1;
-        }
-
-        /*
-         * Same direct-RHS TensorOps structure as Q8_0, but for F16 model
-         * matrices.  The 128-token RHS tile is kept when the batch alignment
-         * allows it because the later tile_n=64 retest was neutral/slower.
-         */
-        if (ds4_gpu_mpp_available() &&
-            n_tok >= 32u &&
-            (in_dim % 32u) == 0 &&
-            (out_dim % 64u) == 0 &&
-            (n_tok % 32u) == 0) {
-            uint64_t nax_tile_n = 32u;
-            if ((n_tok % 128u) == 0) {
-                nax_tile_n = 128u;
-            } else if ((n_tok % 64u) == 0) {
-                nax_tile_n = 64u;
-            }
-            const char *nax_fn = nax_tile_n == 128u
-                ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128"
-                : (nax_tile_n == 64u
-                    ? "kernel_mul_mm_f16_f32_mpp_direct_rhs_n64"
-                    : "kernel_mul_mm_f16_f32_mpp_direct_rhs");
-            id<MTLComputePipelineState> pipeline =
-                ds4_gpu_get_mul_mm_pipeline(nax_fn, false, false);
-            if (pipeline) {
-                ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
-
-                id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-                [enc setComputePipelineState:pipeline];
-                [enc setBytes:&args length:sizeof(args) atIndex:0];
-                [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-                [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-                [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-                [enc setThreadgroupMemoryLength:2u * 64u * 32u * sizeof(uint16_t) atIndex:0];
-                [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(n_tok / nax_tile_n),
-                                                      (NSUInteger)out_dim / 64u,
-                                                      1)
-                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                ds4_gpu_end_compute_encoder(cb, enc);
-
-                if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 NAX tensor matmul")) {
-                    return 0;
-                }
-                return 1;
-            }
-            ds4_gpu_warn_mpp_fallback();
-        }
-
-        const bool bc_inp = (in_dim % 32u) != 0;
-        const bool bc_out = (out_dim % 64u) != 0 || (n_tok % 32u) != 0;
-        id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mm_pipeline("kernel_mul_mm_f16_f32", bc_inp, bc_out);
-        if (!pipeline) return 0;
-
-        ds4_gpu_mul_mm_args args = ds4_gpu_make_mm_args(in_dim, out_dim, n_tok, row_bytes);
-
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-        [enc setComputePipelineState:pipeline];
-        [enc setBytes:&args length:sizeof(args) atIndex:0];
-        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
-        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
-        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
-        [enc setThreadgroupMemoryLength:(bc_out ? 8192u : 6144u) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)n_tok + 31u) / 32u,
-                                              ((NSUInteger)out_dim + 63u) / 64u,
-                                              1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-        ds4_gpu_end_compute_encoder(cb, enc);
-
-        if (!ds4_gpu_finish_command_buffer(cb, owned, "F16 tensor matmul")) return 0;
+        return rc > 0;
     }
-
-    return 1;
 }
 
 int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out,
