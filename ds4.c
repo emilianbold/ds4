@@ -44519,71 +44519,144 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
     bpe_tokenize_text(&e->vocab, text ? text : "", out);
 }
 
+/* Chat markers recognised in rendered prompt text, tried in this order at each
+ * position, with the vocab field holding each one's control id.  The System
+ * marker exists only in the DeepSeek V4.1 chat format. */
+static const struct {
+    const char *text;
+    size_t id_offset;
+    bool deepseek41_only;
+} rendered_markers[] = {
+    {"<｜begin▁of▁sentence｜>", offsetof(ds4_vocab, bos_id), false},
+    {"<｜end▁of▁sentence｜>",   offsetof(ds4_vocab, eos_id), false},
+    {"[gMASK]",                offsetof(ds4_vocab, bos_id), false},
+    {"<sop>",                  offsetof(ds4_vocab, sop_id), false},
+    {"<|system|>",             offsetof(ds4_vocab, system_id), false},
+    {"<｜System｜>",            offsetof(ds4_vocab, system_id), true},
+    {"<｜User｜>",              offsetof(ds4_vocab, user_id), false},
+    {"<｜Assistant｜>",         offsetof(ds4_vocab, assistant_id), false},
+    {"<|user|>",               offsetof(ds4_vocab, user_id), false},
+    {"<|assistant|>",          offsetof(ds4_vocab, assistant_id), false},
+    {"<|observation|>",        offsetof(ds4_vocab, observation_id), false},
+    {"<think>",                offsetof(ds4_vocab, think_start_id), false},
+    {"</think>",               offsetof(ds4_vocab, think_end_id), false},
+    {"<tool_call>",            offsetof(ds4_vocab, tool_call_start_id), false},
+    {"</tool_call>",           offsetof(ds4_vocab, tool_call_end_id), false},
+    {"<tool_response>",        offsetof(ds4_vocab, tool_response_start_id), false},
+    {"</tool_response>",       offsetof(ds4_vocab, tool_response_end_id), false},
+    {"<arg_key>",              offsetof(ds4_vocab, arg_key_start_id), false},
+    {"</arg_key>",             offsetof(ds4_vocab, arg_key_end_id), false},
+    {"<arg_value>",            offsetof(ds4_vocab, arg_value_start_id), false},
+    {"</arg_value>",           offsetof(ds4_vocab, arg_value_end_id), false},
+    {"｜DSML｜",                offsetof(ds4_vocab, dsml_id), false},
+    {"<|im_start|>",           offsetof(ds4_vocab, im_start_id), false},
+    {"<|im_end|>",             offsetof(ds4_vocab, im_end_id), false},
+    {"<|endoftext|>",          offsetof(ds4_vocab, endoftext_id), false},
+};
+
+#define DS4_RENDERED_MARKERS (sizeof(rendered_markers) / sizeof(rendered_markers[0]))
+
+static int rendered_marker_id(const ds4_vocab *vocab, size_t i) {
+    if (rendered_markers[i].deepseek41_only && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
+        return -1;
+    return *(const int *)((const char *)vocab + rendered_markers[i].id_offset);
+}
+
+static bool rendered_marker_first_byte(uint8_t c) {
+    return c == '<' || c == '[' || c == 0xef;
+}
+
+size_t ds4_rendered_marker_len(const char *p) {
+    if (!p || !rendered_marker_first_byte((uint8_t)*p)) return 0;
+    for (size_t i = 0; i < DS4_RENDERED_MARKERS; i++) {
+        const size_t n = strlen(rendered_markers[i].text);
+        if (!strncmp(p, rendered_markers[i].text, n)) return n;
+    }
+    return 0;
+}
+
+static bool rendered_literal_at(const char *p) {
+    return !memcmp(p, DS4_RENDERED_LITERAL, sizeof(DS4_RENDERED_LITERAL) - 1);
+}
+
+/* Tokenize text between control markers, first removing DS4_RENDERED_LITERAL
+ * escapes so the escaped marker or character joins the surrounding text as
+ * BPE input, exactly as if it had been written there unescaped. */
+static void tokenize_rendered_span(const ds4_vocab *vocab, const char *p, uint64_t n,
+                                   bool escaped, token_vec *out) {
+    if (!escaped) {
+        bpe_tokenize_span(vocab, p, n, out);
+        return;
+    }
+    const size_t lit = sizeof(DS4_RENDERED_LITERAL) - 1;
+    char *clean = xmalloc((size_t)n + 1);
+    uint64_t m = 0;
+    for (uint64_t i = 0; i < n;) {
+        if (n - i >= lit && rendered_literal_at(p + i)) {
+            i += lit;
+            size_t keep = n - i >= lit && rendered_literal_at(p + i) ? lit
+                                                                    : ds4_rendered_marker_len(p + i);
+            if (keep > n - i) keep = (size_t)(n - i);
+            memcpy(clean + m, p + i, keep);
+            m += keep;
+            i += keep;
+        } else {
+            clean[m++] = p[i++];
+        }
+    }
+    bpe_tokenize_span(vocab, clean, m, out);
+    free(clean);
+}
+
 /* Split rendered chat text at marker strings: markers become their control
  * ids and the text between them goes through plain BPE.  At each position
  * markers are tried in table order; only bytes that start an active marker
- * are tried at all, so ordinary text costs one table lookup per byte.  Ids
- * are resolved per call because the System marker depends on the family. */
+ * or an escape are tried at all, so ordinary text costs one table lookup per
+ * byte.  DS4_RENDERED_LITERAL before a marker or before itself makes that
+ * text literal (see ds4.h). */
 static void tokenize_rendered_chat_vocab(const ds4_vocab *vocab, const char *text,
                                          token_vec *out) {
     if (!text) text = "";
 
-    struct {
-        const char *text;
-        int token;
-    } specials[] = {
-        {"<｜begin▁of▁sentence｜>", vocab->bos_id},
-        {"<｜end▁of▁sentence｜>",   vocab->eos_id},
-        {"[gMASK]",                vocab->bos_id},
-        {"<sop>",                  vocab->sop_id},
-        {"<|system|>",             vocab->system_id},
-        {"<｜System｜>",            DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ? vocab->system_id : -1},
-        {"<｜User｜>",              vocab->user_id},
-        {"<｜Assistant｜>",         vocab->assistant_id},
-        {"<|user|>",               vocab->user_id},
-        {"<|assistant|>",          vocab->assistant_id},
-        {"<|observation|>",        vocab->observation_id},
-        {"<think>",                vocab->think_start_id},
-        {"</think>",               vocab->think_end_id},
-        {"<tool_call>",            vocab->tool_call_start_id},
-        {"</tool_call>",           vocab->tool_call_end_id},
-        {"<tool_response>",        vocab->tool_response_start_id},
-        {"</tool_response>",       vocab->tool_response_end_id},
-        {"<arg_key>",              vocab->arg_key_start_id},
-        {"</arg_key>",             vocab->arg_key_end_id},
-        {"<arg_value>",            vocab->arg_value_start_id},
-        {"</arg_value>",           vocab->arg_value_end_id},
-        {"｜DSML｜",                vocab->dsml_id},
-        {"<|im_start|>",           vocab->im_start_id},
-        {"<|im_end|>",             vocab->im_end_id},
-        {"<|endoftext|>",          vocab->endoftext_id},
-    };
-    const int n_specials = (int)(sizeof(specials) / sizeof(specials[0]));
-    size_t len[sizeof(specials) / sizeof(specials[0])];
+    int id[DS4_RENDERED_MARKERS];
+    size_t len[DS4_RENDERED_MARKERS];
     bool starts[256] = {false};
-    for (int i = 0; i < n_specials; i++) {
-        len[i] = strlen(specials[i].text);
-        if (specials[i].token >= 0) starts[(uint8_t)specials[i].text[0]] = true;
+    starts[(uint8_t)DS4_RENDERED_LITERAL[0]] = true;
+    for (size_t i = 0; i < DS4_RENDERED_MARKERS; i++) {
+        id[i] = rendered_marker_id(vocab, i);
+        len[i] = strlen(rendered_markers[i].text);
+        if (id[i] >= 0) starts[(uint8_t)rendered_markers[i].text[0]] = true;
     }
 
     const char *span = text;
     const char *p = text;
+    bool escaped = false;
     while (*p) {
-        if (starts[(uint8_t)*p]) {
-            int i = 0;
-            while (i < n_specials &&
-                   (specials[i].token < 0 || strncmp(p, specials[i].text, len[i]))) i++;
-            if (i < n_specials) {
-                bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
-                token_vec_push(out, specials[i].token);
-                p += len[i];
-                span = p;
-                continue;
-            }
+        if (!starts[(uint8_t)*p]) {
+            p++;
+            continue;
         }
-        p++;
+        if (rendered_literal_at(p)) {
+            escaped = true;
+            p += sizeof(DS4_RENDERED_LITERAL) - 1;
+            if (rendered_literal_at(p)) p += sizeof(DS4_RENDERED_LITERAL) - 1;
+            else p += ds4_rendered_marker_len(p);
+            continue;
+        }
+        size_t i = 0;
+        while (i < DS4_RENDERED_MARKERS &&
+               (id[i] < 0 || strncmp(p, rendered_markers[i].text, len[i]))) i++;
+        if (i == DS4_RENDERED_MARKERS) {
+            p++;
+            continue;
+        }
+        tokenize_rendered_span(vocab, span, (uint64_t)(p - span), escaped, out);
+        token_vec_push(out, id[i]);
+        p += len[i];
+        span = p;
+        escaped = false;
     }
-    bpe_tokenize_span(vocab, span, (uint64_t)(p - span), out);
+    tokenize_rendered_span(vocab, span, (uint64_t)(p - span), escaped, out);
 }
 
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out) {

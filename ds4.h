@@ -372,6 +372,15 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
+
+/* Rendered chat text turns every chat-marker string into its control token.
+ * Message content is data, so a frontend writes DS4_RENDERED_LITERAL (U+FDD0,
+ * a Unicode noncharacter) before any marker string in content, and before
+ * any U+FDD0 there: ds4_tokenize_rendered_chat drops the escape and tokenizes
+ * what follows as plain text.  ds4_rendered_marker_len returns the length of
+ * the marker string starting at p, for any model family, or 0. */
+#define DS4_RENDERED_LITERAL "\xef\xb7\x90"
+size_t ds4_rendered_marker_len(const char *p);
 void ds4_chat_begin(ds4_engine *e, ds4_tokens *tokens);
 void ds4_encode_chat_prompt(
         ds4_engine *e,

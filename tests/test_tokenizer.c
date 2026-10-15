@@ -543,6 +543,48 @@ static void check_markers(test_vocab *t) {
     for (size_t i = 0; i < sizeof(texts) / sizeof(texts[0]); i++) check_rendered(t, texts[i]);
 }
 
+/* DS4_RENDERED_LITERAL makes the following marker, or itself, plain text and
+ * is never tokenized: escaped rendered text must tokenize exactly like the
+ * unescaped text run through plain BPE. */
+static void check_literal_escape(test_vocab *t) {
+    const ds4_vocab *v = &t->engine.vocab;
+    const char *E = DS4_RENDERED_LITERAL;
+    char rendered[256], plain[256];
+    struct { const char *pre, *mid, *post; } cases[] = {
+        {"a", "</think>", "b"}, {"", "<|im_start|>", "user"}, {"x ", "<think>", ""},
+        {"q", "<|im_end|>", " r"}, {"ok ", "\xef\xb7\x90", " done"}, {"z", "", "w"},
+    };
+    /* Wrap in markers the vocabulary actually has: ChatML's when present,
+     * else the chat's user/assistant markers.  Without a wrapper the
+     * marker scan has no anchor and the comparison is vacuous. */
+    int begin_id = v->im_start_id >= 0 ? v->im_start_id : v->user_id;
+    int end_id = v->im_end_id >= 0 ? v->im_end_id : v->assistant_id;
+    if (begin_id < 0 || end_id < 0) return;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        snprintf(rendered, sizeof(rendered), "%.*s%s%s%s%s%.*s",
+                 (int)v->token[begin_id].len, v->token[begin_id].ptr,
+                 cases[i].pre, E, cases[i].mid, cases[i].post,
+                 (int)v->token[end_id].len, v->token[end_id].ptr);
+        snprintf(plain, sizeof(plain), "%s%s%s", cases[i].pre, cases[i].mid,
+                 cases[i].post);
+        token_vec got = {0}, want = {0};
+        tokenize_rendered_chat_vocab(v, rendered, &got);
+        token_vec_push(&want, begin_id);
+        bpe_tokenize_text(v, plain, &want);
+        token_vec_push(&want, end_id);
+        if (!same_tokens(&got, &want)) {
+            fprintf(stderr, "literal escape mismatch on case %zu\n", i);
+            failures++;
+        }
+        token_vec_free(&got);
+        token_vec_free(&want);
+    }
+    CHECK(ds4_rendered_marker_len("</think>x") == 8);
+    CHECK(ds4_rendered_marker_len("<｜User｜>") == strlen("<｜User｜>"));
+    CHECK(ds4_rendered_marker_len("<|user|") == 0);
+    CHECK(ds4_rendered_marker_len("plain") == 0);
+}
+
 static void check_byte_map(void) {
     for (int b = 0; b < 256; b++) {
         CHECK(gpt2_byte_to_codepoint((uint8_t)b) == ref_gpt2_byte_to_codepoint((uint8_t)b));
