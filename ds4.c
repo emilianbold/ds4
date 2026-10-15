@@ -43550,17 +43550,6 @@ static bool ascii_space(uint8_t c) {
            c == '\v' || c == '\f';
 }
 
-static bool ascii_newline(uint8_t c) {
-    return c == '\n' || c == '\r';
-}
-
-static bool joyai_ascii_punct_symbol(uint8_t c) {
-    return (c >= '!' && c <= '/') ||
-           (c >= ':' && c <= '@') ||
-           (c >= '[' && c <= '`') ||
-           (c >= '{' && c <= '~');
-}
-
 static bool utf8_is_cjk_hira_kata(uint32_t cp) {
     return (cp >= 0x4e00 && cp <= 0x9fa5) ||
            (cp >= 0x3040 && cp <= 0x309f) ||
@@ -43589,272 +43578,9 @@ static uint32_t utf8_peek_one(const char *s, uint64_t len, uint64_t pos, uint64_
            ((uint32_t)((uint8_t)s[pos + 3] & 0x3f));
 }
 
-static bool joyai_letter_like_at(const char *s, uint64_t len, uint64_t pos) {
-    (void)len;
-    uint8_t c = (uint8_t)s[pos];
-    if (c < 128) return ascii_alpha(c);
-
-    /*
-     * The JoyAI tokenizer maps Unicode letters into a collapsed regex alphabet before
-     * applying the JoyAI pre-tokenizer.  The prompts we care about are mostly
-     * ASCII, but treating non-ASCII non-control bytes as letters preserves the
-     * useful behavior for ordinary UTF-8 text such as Italian accents.  CJK and
-     * kana are isolated by the JoyAI pre-tokenizer before the generic letter
-     * rule, below.
-     */
-    return true;
-}
-
-static uint64_t joyai_consume_letters(const char *s, uint64_t len, uint64_t pos) {
-    while (pos < len && joyai_letter_like_at(s, len, pos)) {
-        pos = next_utf8_char(s, len, pos);
-    }
-    return pos;
-}
-
-static bool joyai_cjk_at(const char *s, uint64_t len, uint64_t pos) {
-    if ((uint8_t)s[pos] < 128) return false;
-    uint64_t next = pos;
-    uint32_t cp = utf8_peek_one(s, len, pos, &next);
-    return utf8_is_cjk_hira_kata(cp);
-}
-
-typedef struct {
-    uint32_t cp;
-    uint64_t next;
-    bool valid;
-    bool is_letter;
-    bool is_number;
-    bool is_whitespace;
-} glm4_char_info;
-
-static bool glm4_unicode_whitespace(uint32_t cp) {
-    if (cp < 128) return ascii_space((uint8_t)cp);
-    return cp == 0x0085 ||
-           cp == 0x00a0 ||
-           cp == 0x1680 ||
-           (cp >= 0x2000 && cp <= 0x200a) ||
-           cp == 0x2028 ||
-           cp == 0x2029 ||
-           cp == 0x202f ||
-           cp == 0x205f ||
-           cp == 0x3000;
-}
-
-static bool glm4_unicode_number(uint32_t cp) {
-    if (cp < 128) return ascii_digit((uint8_t)cp);
-    return (cp >= 0x0660 && cp <= 0x0669) ||
-           (cp >= 0x06f0 && cp <= 0x06f9) ||
-           (cp >= 0x07c0 && cp <= 0x07c9) ||
-           (cp >= 0x0966 && cp <= 0x096f) ||
-           (cp >= 0x09e6 && cp <= 0x09ef) ||
-           (cp >= 0x0a66 && cp <= 0x0a6f) ||
-           (cp >= 0x0ae6 && cp <= 0x0aef) ||
-           (cp >= 0x0b66 && cp <= 0x0b6f) ||
-           (cp >= 0x0be6 && cp <= 0x0bef) ||
-           (cp >= 0x0c66 && cp <= 0x0c6f) ||
-           (cp >= 0x0ce6 && cp <= 0x0cef) ||
-           (cp >= 0x0d66 && cp <= 0x0d6f) ||
-           (cp >= 0x0de6 && cp <= 0x0def) ||
-           (cp >= 0x0e50 && cp <= 0x0e59) ||
-           (cp >= 0x0ed0 && cp <= 0x0ed9) ||
-           (cp >= 0x0f20 && cp <= 0x0f29) ||
-           (cp >= 0x1040 && cp <= 0x1049) ||
-           (cp >= 0x1090 && cp <= 0x1099) ||
-           (cp >= 0x17e0 && cp <= 0x17e9) ||
-           (cp >= 0x1810 && cp <= 0x1819) ||
-           (cp >= 0xff10 && cp <= 0xff19);
-}
-
-static bool glm4_unicode_punct_symbol(uint32_t cp) {
-    if (cp < 128) return joyai_ascii_punct_symbol((uint8_t)cp);
-    return (cp >= 0x00a1 && cp <= 0x00a9) ||
-           (cp >= 0x00ab && cp <= 0x00ac) ||
-           (cp >= 0x00ae && cp <= 0x00b1) ||
-           cp == 0x00b4 ||
-           (cp >= 0x00b6 && cp <= 0x00b8) ||
-           cp == 0x00bb ||
-           cp == 0x00bf ||
-           cp == 0x00d7 ||
-           cp == 0x00f7 ||
-           (cp >= 0x02c2 && cp <= 0x02df) ||
-           (cp >= 0x02e5 && cp <= 0x02eb) ||
-           (cp >= 0x02ed && cp <= 0x02ff) ||
-           (cp >= 0x0375 && cp <= 0x037e) ||
-           (cp >= 0x0384 && cp <= 0x0385) ||
-           cp == 0x0387 ||
-           (cp >= 0x055a && cp <= 0x055f) ||
-           (cp >= 0x0589 && cp <= 0x058a) ||
-           (cp >= 0x05be && cp <= 0x05c0) ||
-           cp == 0x05c3 ||
-           (cp >= 0x05c6 && cp <= 0x05c7) ||
-           (cp >= 0x0609 && cp <= 0x060a) ||
-           (cp >= 0x060c && cp <= 0x060d) ||
-           cp == 0x061b ||
-           (cp >= 0x061e && cp <= 0x061f) ||
-           cp == 0x066a ||
-           cp == 0x066d ||
-           cp == 0x06d4 ||
-           (cp >= 0x2000 && cp <= 0x206f) ||
-           (cp >= 0x20a0 && cp <= 0x20cf) ||
-           (cp >= 0x2100 && cp <= 0x214f) ||
-           (cp >= 0x2190 && cp <= 0x23ff) ||
-           (cp >= 0x2460 && cp <= 0x24ff) ||
-           (cp >= 0x2500 && cp <= 0x2775) ||
-           (cp >= 0x2794 && cp <= 0x2bff) ||
-           (cp >= 0x2e00 && cp <= 0x2e7f) ||
-           (cp >= 0x3000 && cp <= 0x303f) ||
-           (cp >= 0xfd3e && cp <= 0xfd3f) ||
-           (cp >= 0xfe10 && cp <= 0xfe6f) ||
-           (cp >= 0xff01 && cp <= 0xff0f) ||
-           (cp >= 0xff1a && cp <= 0xff20) ||
-           (cp >= 0xff3b && cp <= 0xff40) ||
-           (cp >= 0xff5b && cp <= 0xff65) ||
-           (cp >= 0x1f000 && cp <= 0x1faff);
-}
-
-static glm4_char_info glm4_char_at(const char *s, uint64_t len, uint64_t pos) {
-    glm4_char_info info;
-    memset(&info, 0, sizeof(info));
-    if (pos >= len) return info;
-
-    info.valid = true;
-    info.cp = utf8_peek_one(s, len, pos, &info.next);
-    info.is_whitespace = glm4_unicode_whitespace(info.cp);
-    info.is_number = glm4_unicode_number(info.cp);
-    if (info.cp < 128) {
-        info.is_letter = ascii_alpha((uint8_t)info.cp);
-    } else {
-        info.is_letter =
-            !info.is_whitespace &&
-            !info.is_number &&
-            !glm4_unicode_punct_symbol(info.cp);
-    }
-    return info;
-}
-
 static uint32_t ascii_tolower_cp(uint32_t cp) {
     if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
     return cp;
-}
-
-/* ChatGLM4/GLM pre-tokenization.  GLM GGUFs use tokenizer.ggml.pre="glm4",
- * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path. */
-static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, uint64_t len,
-                                   token_vec *out) {
-    uint64_t pos = 0;
-
-    while (pos < len) {
-        uint64_t start = pos;
-        glm4_char_info cur = glm4_char_at(text, len, pos);
-
-        if (!cur.valid) break;
-
-        if (cur.cp == '\'' && cur.next < len) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
-            uint32_t n1 = ascii_tolower_cp(next.cp);
-            if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
-                pos = next.next;
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-                continue;
-            }
-            if (next.valid && next.next < len) {
-                glm4_char_info next2 = glm4_char_at(text, len, next.next);
-                uint32_t n2 = ascii_tolower_cp(next2.cp);
-                if ((n1 == 'r' && n2 == 'e') ||
-                    (n1 == 'v' && n2 == 'e') ||
-                    (n1 == 'l' && n2 == 'l')) {
-                    pos = next2.next;
-                    bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-                    continue;
-                }
-            }
-        }
-
-        if (!(cur.cp == '\r' || cur.cp == '\n' || cur.is_number)) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
-            if (cur.is_letter || next.is_letter) {
-                pos = cur.next;
-                while (pos < len) {
-                    glm4_char_info scan = glm4_char_at(text, len, pos);
-                    if (!scan.valid || !scan.is_letter) break;
-                    pos = scan.next;
-                }
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-                continue;
-            }
-        }
-
-        if (cur.is_number) {
-            int ndigits = 0;
-            while (pos < len && ndigits < 3) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid || !scan.is_number) break;
-                pos = scan.next;
-                ndigits++;
-            }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-            continue;
-        }
-
-        glm4_char_info punct = cur;
-        uint64_t punct_pos = pos;
-        if (cur.cp == ' ') {
-            punct_pos = cur.next;
-            punct = glm4_char_at(text, len, punct_pos);
-        }
-        if (punct.valid &&
-            !punct.is_whitespace &&
-            !punct.is_letter &&
-            !punct.is_number) {
-            pos = punct_pos;
-            while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid ||
-                    scan.is_whitespace ||
-                    scan.is_letter ||
-                    scan.is_number) {
-                    break;
-                }
-                pos = scan.next;
-            }
-            while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
-                if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
-                pos = scan.next;
-            }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-            continue;
-        }
-
-        if (cur.is_whitespace) {
-            uint64_t p = pos;
-            uint64_t last_newline_end = 0;
-            uint64_t last_ws_start = pos;
-            int nspace = 0;
-            while (p < len) {
-                glm4_char_info scan = glm4_char_at(text, len, p);
-                if (!scan.valid || !scan.is_whitespace) break;
-                last_ws_start = p;
-                if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
-                p = scan.next;
-                nspace++;
-            }
-            if (last_newline_end) {
-                pos = last_newline_end;
-            } else if (nspace > 1 && p < len) {
-                pos = last_ws_start;
-            } else {
-                pos = p;
-            }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-            continue;
-        }
-
-        pos = cur.next;
-        if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-    }
 }
 
 #include "ds4_qwen4_unicode.inc"
@@ -43898,10 +43624,11 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
         c.space = ascii_space((uint8_t)c.cp);
         return c;
     }
-    c.letter = DS4_QWEN4_CLASS(letter, c.cp);
-    c.mark = DS4_QWEN4_CLASS(mark, c.cp);
-    c.number = DS4_QWEN4_CLASS(number, c.cp);
-    c.space = DS4_QWEN4_CLASS(space, c.cp);
+    /* Disjoint classes: stop at the first hit (see deepseek_char_at). */
+    (void)((c.letter = DS4_QWEN4_CLASS(letter, c.cp)) ||
+           (c.mark = DS4_QWEN4_CLASS(mark, c.cp)) ||
+           (c.number = DS4_QWEN4_CLASS(number, c.cp)) ||
+           (c.space = DS4_QWEN4_CLASS(space, c.cp)));
     return c;
 }
 
@@ -44079,13 +43806,51 @@ static bool qwen4_nfc(const char *text, uint64_t len, char **out, uint64_t *out_
     return true;
 }
 
-/* Qwen3.8 pre-tokenization (tokenizer.ggml.pre = "qwen35"), the ordered
- * alternation
- *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
- *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
- * with the Unicode classes generated from the `regex` module. */
-static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, uint64_t len,
-                                     token_vec *out) {
+/* The GPT-2 style split regex shared by the Qwen3.8 and GLM releases, as
+ * the ordered alternation
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?W+ | \p{N}{1,D} |
+ *    ?[^\s\p{N}W]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
+ * where W is [\p{L}\p{M}] for Qwen and \p{L} for GLM, and D is 1 for Qwen
+ * and 3 for GLM.  The Unicode classes are generated from the `regex` module.
+ * GLM's release also sets ignore_merges: a piece that is itself a vocab
+ * entry is emitted whole, without running the merges. */
+typedef struct {
+    bool marks_in_words;
+    int max_digits;
+    bool ignore_merges;
+} gpt2_split;
+
+static const gpt2_split qwen35_split = { true, 1, false };
+static const gpt2_split glm_split = { false, 3, true };
+
+static bool gpt2_word_char(const gpt2_split *opt, const qwen4_char_info *c) {
+    return c->letter || (opt->marks_in_words && c->mark);
+}
+
+/* ignore_merges: look the whole piece up in its byte-level spelling before
+ * merging.  Every byte maps to a codepoint below U+0800, so two UTF-8 bytes
+ * per input byte suffice. */
+static void bpe_emit_word(const ds4_vocab *vocab, ds4_str piece, bool ignore_merges,
+                          token_vec *out) {
+    if (ignore_merges && piece.len) {
+        char stack[256];
+        char *buf = piece.len * 2 <= sizeof(stack) ? stack : xmalloc((size_t)piece.len * 2);
+        char *p = buf;
+        for (uint64_t i = 0; i < piece.len; i++)
+            utf8_put(&p, gpt2_byte_to_codepoint((uint8_t)piece.ptr[i]));
+        int id = -1;
+        const bool whole = table_get(&vocab->token_to_id, buf, (uint64_t)(p - buf), &id);
+        if (buf != stack) free(buf);
+        if (whole) {
+            token_vec_push(out, id);
+            return;
+        }
+    }
+    bpe_emit_piece(vocab, piece, out);
+}
+
+static void bpe_tokenize_text_gpt2(const ds4_vocab *vocab, const char *text, uint64_t len,
+                                   const gpt2_split *opt, token_vec *out) {
     uint64_t pos = 0;
 
     while (pos < len) {
@@ -44098,7 +43863,7 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, u
             const uint32_t c1 = ascii_tolower_cp(n1.cp);
             if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') {
                 pos = n1.next;
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
                 continue;
             }
             if (n1.valid && n1.next < len) {
@@ -44106,7 +43871,7 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, u
                 const uint32_t c2 = ascii_tolower_cp(n2.cp);
                 if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
                     pos = n2.next;
-                    bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                    bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
                     continue;
                 }
             }
@@ -44115,27 +43880,32 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, u
         /* an optional non-letter prefix, then a run of letters and marks */
         {
             uint64_t run = UINT64_MAX;
-            if (cur.letter || cur.mark) {
+            if (gpt2_word_char(opt, &cur)) {
                 run = cur.next;
             } else if (cur.cp != '\r' && cur.cp != '\n' && !cur.number) {
                 qwen4_char_info n1 = qwen4_char_at(text, len, cur.next);
-                if (n1.valid && (n1.letter || n1.mark)) run = n1.next;
+                if (n1.valid && gpt2_word_char(opt, &n1)) run = n1.next;
             }
             if (run != UINT64_MAX) {
                 pos = run;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || !(scan.letter || scan.mark)) break;
+                    if (!scan.valid || !gpt2_word_char(opt, &scan)) break;
                     pos = scan.next;
                 }
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
                 continue;
             }
         }
 
         if (cur.number) {
             pos = cur.next;
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            for (int n = 1; n < opt->max_digits && pos < len; n++) {
+                qwen4_char_info scan = qwen4_char_at(text, len, pos);
+                if (!scan.valid || !scan.number) break;
+                pos = scan.next;
+            }
+            bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
             continue;
         }
 
@@ -44146,11 +43916,11 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, u
                 punct_pos = cur.next;
                 punct = qwen4_char_at(text, len, punct_pos);
             }
-            if (punct.valid && !punct.space && !punct.letter && !punct.mark && !punct.number) {
+            if (punct.valid && !punct.space && !punct.number && !gpt2_word_char(opt, &punct)) {
                 pos = punct_pos;
                 while (pos < len) {
                     qwen4_char_info scan = qwen4_char_at(text, len, pos);
-                    if (!scan.valid || scan.space || scan.letter || scan.mark || scan.number) break;
+                    if (!scan.valid || scan.space || scan.number || gpt2_word_char(opt, &scan)) break;
                     pos = scan.next;
                 }
                 while (pos < len) {
@@ -44158,7 +43928,7 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, u
                     if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
                     pos = scan.next;
                 }
-                bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+                bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
                 continue;
             }
         }
@@ -44183,118 +43953,250 @@ static void bpe_tokenize_text_qwen35(const ds4_vocab *vocab, const char *text, u
             } else {
                 pos = p;
             }
-            bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+            bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
             continue;
         }
 
         pos = cur.next;
         if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
+        bpe_emit_word(vocab, (ds4_str){ text + start, pos - start }, opt->ignore_merges, out);
     }
 }
 
-/*
- * DeepSeek V4 Flash declares tokenizer.ggml.pre = "joyai-llm".  The split
- * below mirrors the JoyAI BPE pre-tokenizer for the cases this model
- * uses in normal text and source-code prompts:
+/* DeepSeek V4 and V4.1 (tokenizer.ggml.pre = "joyai-llm") pre-tokenize with
+ * three regex splits applied in sequence, each to the pieces of the last:
  *
- *   \p{N}{1,3}
- *   [CJK/Hiragana/Katakana]+
- *   [P/S][A-Za-z]+
- *   [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
- *    ?[\p{P}\p{S}]+[\r\n]*
- *   \s*[\r\n]+
- *   \s+(?!\S)
- *   \s+
+ *   1. \p{N}{1,3}
+ *   2. [一-龥぀-ゟ゠-ヿ]+             (CJK ideographs, hiragana, katakana)
+ *   3. [ASCII punct][A-Za-z]+ | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ |
+ *       ?[\p{P}\p{S}]+[\r\n]* | \s*[\r\n]+ | \s+(?!\S) | \s+
  *
- * The punctuation rule intentionally keeps trailing newlines in the same BPE
- * word (for example ">;\n").  Splitting those newlines separately changes the
- * token stream for code prompts and produces wrong long-context logits.
- */
+ * Each split keeps the text between matches as pieces too.  Split 3 runs
+ * inside the CJK runs of split 2 as well (katakana U+30A0 is punctuation),
+ * and its lookahead and prefixes stop at the piece edges.  The punctuation
+ * rule keeps trailing newlines in the same piece (">;\n"). */
+typedef struct {
+    uint32_t cp;
+    uint64_t next;
+    bool letter, mark, number, space, punct, symbol;
+} deepseek_char;
+
+/* ASCII classes as bits: 1 letter, 4 number, 8 space, 16 punct, 32 symbol
+ * (no ASCII marks).  The same answers as the tables; tests/test_tokenizer
+ * checks all 128. */
+static const uint8_t deepseek_ascii_class[128] = {
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  8,  8,  8,  8,  8,  0,  0,
+     0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,
+     8, 16, 16, 16, 32, 16, 16, 16, 16, 16, 16, 32, 16, 16, 16, 16,
+     4,  4,  4,  4,  4,  4,  4,  4,  4,  4, 16, 16, 32, 32, 32, 16,
+    16,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1, 16, 16, 16, 32, 16,
+    32,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1,
+     1,  1,  1,  1,  1,  1,  1,  1,  1,  1,  1, 16, 32, 16, 32,  0,
+};
+
+static deepseek_char deepseek_char_at(const char *s, uint64_t len, uint64_t pos) {
+    deepseek_char c = {0};
+    const uint8_t b = (uint8_t)s[pos];
+    if (b < 128) {
+        const uint8_t f = deepseek_ascii_class[b];
+        c.cp = b;
+        c.next = pos + 1;
+        c.letter = f & 1;
+        c.number = f & 4;
+        c.space = f & 8;
+        c.punct = f & 16;
+        c.symbol = f & 32;
+        return c;
+    }
+    c.cp = utf8_peek_one(s, len, pos, &c.next);
+    /* The classes are disjoint (general categories L, M, N, P, S, and
+     * whitespace, which is Z or control), so stop at the first hit. */
+    (void)((c.letter = DS4_QWEN4_CLASS(letter, c.cp)) ||
+           (c.mark = DS4_QWEN4_CLASS(mark, c.cp)) ||
+           (c.number = DS4_QWEN4_CLASS(number, c.cp)) ||
+           (c.punct = DS4_QWEN4_CLASS(punct, c.cp)) ||
+           (c.symbol = DS4_QWEN4_CLASS(symbol, c.cp)) ||
+           (c.space = DS4_QWEN4_CLASS(space, c.cp)));
+    return c;
+}
+
+/* Splits 1 and 2 only ask whether a character is a number or CJK. */
+static bool deepseek_number_at(const char *s, uint64_t len, uint64_t pos, uint32_t *cp,
+                               uint64_t *next) {
+    *cp = utf8_peek_one(s, len, pos, next);
+    return *cp < 128 ? ascii_digit((uint8_t)*cp) : DS4_QWEN4_CLASS(number, *cp);
+}
+
+/* Runs that continue a split-3 match: letters/marks, punctuation/symbols,
+ * whitespace.  ASCII bytes are classified from the table directly. */
+static uint64_t deepseek_run(const char *s, uint64_t end, uint64_t p, uint8_t ascii_mask) {
+    while (p < end) {
+        const uint8_t b = (uint8_t)s[p];
+        if (b < 128) {
+            if (!(deepseek_ascii_class[b] & ascii_mask)) break;
+            p++;
+            continue;
+        }
+        const deepseek_char r = deepseek_char_at(s, end, p);
+        const bool more = ascii_mask == 1 ? (r.letter || r.mark) :
+                          ascii_mask == 8 ? r.space : (r.punct || r.symbol);
+        if (!more) break;
+        p = r.next;
+    }
+    return p;
+}
+
+/* Whether the character at p (< end) starts a letter/mark run, or is
+ * punctuation/symbol, by `mask` (1 or 48). */
+static bool deepseek_class_at(const char *s, uint64_t end, uint64_t p, uint8_t mask) {
+    const uint8_t b = (uint8_t)s[p];
+    if (b < 128) return deepseek_ascii_class[b] & mask;
+    const deepseek_char r = deepseek_char_at(s, end, p);
+    return mask == 1 ? (r.letter || r.mark) : (r.punct || r.symbol);
+}
+
+static uint64_t deepseek_space_match(const char *s, uint64_t end, uint64_t pos) {
+    uint64_t p = pos, last_newline_end = 0, last_ws = pos;
+    int count = 0;
+    while (p < end) {
+        const uint8_t b = (uint8_t)s[p];
+        uint64_t next = p + 1;
+        if (b < 128) {
+            if (!(deepseek_ascii_class[b] & 8)) break;
+        } else {
+            const deepseek_char r = deepseek_char_at(s, end, p);
+            if (!r.space) break;
+            next = r.next;
+        }
+        last_ws = p;
+        if (b == '\r' || b == '\n') last_newline_end = next;
+        p = next;
+        count++;
+    }
+    if (last_newline_end) return last_newline_end;
+    if (p < end && count > 1) return last_ws;
+    return p;
+}
+
+/* End of the split-3 match at pos within [pos, end), or 0 if none.  The
+ * alternatives are tried in the regex's order. */
+static uint64_t deepseek_match(const char *s, uint64_t end, uint64_t pos) {
+    const uint8_t b = (uint8_t)s[pos];
+    bool letter, mark = false, punct_sym, space;
+    uint64_t next;
+    if (b < 128) {
+        const uint8_t f = deepseek_ascii_class[b];
+        letter = f & 1;
+        punct_sym = f & 48;
+        space = f & 8;
+        next = pos + 1;
+        /* [ASCII punct][A-Za-z]+ */
+        if (punct_sym && next < end && ascii_alpha((uint8_t)s[next])) {
+            uint64_t p = next;
+            while (p < end && ascii_alpha((uint8_t)s[p])) p++;
+            return p;
+        }
+    } else {
+        const deepseek_char c = deepseek_char_at(s, end, pos);
+        letter = c.letter;
+        mark = c.mark;
+        punct_sym = c.punct || c.symbol;
+        space = c.space;
+        next = c.next;
+    }
+    const bool has_next = next < end;
+
+    /* [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+ */
+    if (letter || mark) return deepseek_run(s, end, next, 1);
+    if (b != '\r' && b != '\n' && !punct_sym && has_next && deepseek_class_at(s, end, next, 1)) {
+        const uint64_t after = (uint8_t)s[next] < 128 ? next + 1
+                                                      : deepseek_char_at(s, end, next).next;
+        return deepseek_run(s, end, after, 1);
+    }
+
+    /*  ?[\p{P}\p{S}]+[\r\n]* */
+    uint64_t ps = 0;
+    if (punct_sym) ps = next;
+    else if (b == ' ' && has_next && deepseek_class_at(s, end, next, 48))
+        ps = (uint8_t)s[next] < 128 ? next + 1 : deepseek_char_at(s, end, next).next;
+    if (ps) {
+        ps = deepseek_run(s, end, ps, 48);
+        while (ps < end && (s[ps] == '\r' || s[ps] == '\n')) ps++;
+        return ps;
+    }
+
+    /* \s*[\r\n]+ | \s+(?!\S) | \s+ */
+    if (space) return deepseek_space_match(s, end, pos);
+    return 0;
+}
+
+/* Split 3 over one piece of splits 1-2; unmatched text between matches is
+ * a piece of its own. */
+static void deepseek_split3(const ds4_vocab *vocab, const char *s, uint64_t begin,
+                            uint64_t end, token_vec *out) {
+    uint64_t gap = begin;
+    for (uint64_t p = begin; p < end;) {
+        const uint64_t m = deepseek_match(s, end, p);
+        if (!m) {
+            p = next_utf8_char(s, end, p);
+            continue;
+        }
+        if (gap < p) bpe_emit_piece(vocab, (ds4_str){ s + gap, p - gap }, out);
+        bpe_emit_piece(vocab, (ds4_str){ s + p, m - p }, out);
+        p = gap = m;
+    }
+    if (gap < end) bpe_emit_piece(vocab, (ds4_str){ s + gap, end - gap }, out);
+}
+
+static void bpe_tokenize_text_deepseek(const ds4_vocab *vocab, const char *text, uint64_t len,
+                                       token_vec *out) {
+    uint64_t pos = 0;
+    while (pos < len) {
+        uint32_t cp, rcp;
+        uint64_t end, next;
+        if (deepseek_number_at(text, len, pos, &cp, &end)) {
+            /* Number pieces are left whole by split 3: no letter follows. */
+            for (int n = 1; n < 3 && end < len && deepseek_number_at(text, len, end, &rcp, &next); n++)
+                end = next;
+            bpe_emit_piece(vocab, (ds4_str){ text + pos, end - pos }, out);
+        } else {
+            const bool cjk = utf8_is_cjk_hira_kata(cp);
+            while (end < len) {
+                const uint8_t b = (uint8_t)text[end];
+                if (b < 128) {
+                    if (cjk || ascii_digit(b)) break;
+                    end++;
+                    continue;
+                }
+                if (deepseek_number_at(text, len, end, &rcp, &next) ||
+                    utf8_is_cjk_hira_kata(rcp) != cjk) break;
+                end = next;
+            }
+            deepseek_split3(vocab, text, pos, end, out);
+        }
+        pos = end;
+    }
+}
+
 static void bpe_tokenize_span(const ds4_vocab *vocab, const char *text, uint64_t len,
                               token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        bpe_tokenize_text_glm4(vocab, text, len, out);
+        bpe_tokenize_text_gpt2(vocab, text, len, &glm_split, out);
         return;
     }
     if (ds4_model_is_qwen4()) {
         char *nfc = NULL;
         uint64_t nfc_len = 0;
         if (qwen4_nfc(text, len, &nfc, &nfc_len)) {
-            bpe_tokenize_text_qwen35(vocab, nfc, nfc_len, out);
+            bpe_tokenize_text_gpt2(vocab, nfc, nfc_len, &qwen35_split, out);
             free(nfc);
         } else {
-            bpe_tokenize_text_qwen35(vocab, text, len, out);
+            bpe_tokenize_text_gpt2(vocab, text, len, &qwen35_split, out);
         }
         return;
     }
-
-    uint64_t pos = 0;
-
-    while (pos < len) {
-        uint64_t start = pos;
-        uint8_t c = (uint8_t)text[pos];
-
-        if (ascii_digit(c)) {
-            int ndigits = 0;
-            while (pos < len && ascii_digit((uint8_t)text[pos]) && ndigits < 3) {
-                pos++;
-                ndigits++;
-            }
-        } else if (joyai_cjk_at(text, len, pos)) {
-            do {
-                pos = next_utf8_char(text, len, pos);
-            } while (pos < len && joyai_cjk_at(text, len, pos));
-        } else if (joyai_ascii_punct_symbol(c) &&
-                   pos + 1 < len &&
-                   ascii_alpha((uint8_t)text[pos + 1])) {
-            pos++;
-            while (pos < len && ascii_alpha((uint8_t)text[pos])) pos++;
-        } else if (joyai_letter_like_at(text, len, pos)) {
-            pos = joyai_consume_letters(text, len, pos);
-        } else if (!ascii_newline(c) &&
-                   !joyai_ascii_punct_symbol(c) &&
-                   pos + 1 < len &&
-                   joyai_letter_like_at(text, len, pos + 1)) {
-            pos++;
-            pos = joyai_consume_letters(text, len, pos);
-        } else if (c == ' ' &&
-                   pos + 1 < len &&
-                   joyai_ascii_punct_symbol((uint8_t)text[pos + 1])) {
-            pos++;
-            while (pos < len && joyai_ascii_punct_symbol((uint8_t)text[pos])) pos++;
-            while (pos < len && ascii_newline((uint8_t)text[pos])) pos++;
-        } else if (joyai_ascii_punct_symbol(c)) {
-            while (pos < len && joyai_ascii_punct_symbol((uint8_t)text[pos])) pos++;
-            while (pos < len && ascii_newline((uint8_t)text[pos])) pos++;
-        } else if (ascii_space(c)) {
-            uint64_t p = pos;
-            uint64_t last_newline_end = 0;
-            while (p < len && ascii_space((uint8_t)text[p])) {
-                uint8_t sc = (uint8_t)text[p++];
-                if (ascii_newline(sc)) last_newline_end = p;
-            }
-            if (last_newline_end) {
-                pos = last_newline_end;
-            } else if (p < len && p > pos + 1 &&
-                       (joyai_letter_like_at(text, len, p) ||
-                        joyai_ascii_punct_symbol((uint8_t)text[p]))) {
-                /*
-                 * JoyAI lets a single leading space join the following word or
-                 * punctuation run.  For "    int", the pre-tokenizer therefore emits
-                 * "   " then " int", not "    " then "int".
-                 */
-                pos = p - 1;
-            } else {
-                pos = p;
-            }
-        } else {
-            pos = next_utf8_char(text, len, pos);
-        }
-
-        if (pos == start) pos = next_utf8_char(text, len, pos);
-        bpe_emit_piece(vocab, (ds4_str){ text + start, pos - start }, out);
-    }
+    bpe_tokenize_text_deepseek(vocab, text, len, out);
 }
 
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
