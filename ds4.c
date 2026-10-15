@@ -43890,6 +43890,14 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
     if (pos >= len) return c;
     c.valid = true;
     c.cp = utf8_peek_one(s, len, pos, &c.next);
+    if (c.cp < 128) {
+        /* Same answers as the tables (tests/test_tokenizer checks all 128),
+         * without four binary searches per byte of code and JSON. */
+        c.letter = ascii_alpha((uint8_t)c.cp);
+        c.number = ascii_digit((uint8_t)c.cp);
+        c.space = ascii_space((uint8_t)c.cp);
+        return c;
+    }
     c.letter = DS4_QWEN4_CLASS(letter, c.cp);
     c.mark = DS4_QWEN4_CLASS(mark, c.cp);
     c.number = DS4_QWEN4_CLASS(number, c.cp);
