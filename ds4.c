@@ -44243,6 +44243,8 @@ static void vocab_index(ds4_vocab *vocab, const ds4_str *merge, uint64_t n_merge
     }
 }
 
+static void vocab_set_markers(ds4_vocab *vocab, const ds4_model *model);
+
 /* Load token strings, special token ids, and merges from GGUF metadata. */
 static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     memset(vocab, 0, sizeof(*vocab));
@@ -44277,6 +44279,13 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     }
     vocab_index(vocab, merge, merges.len);
     free(merge);
+    vocab_set_markers(vocab, model);
+}
+
+/* Resolve the chat-marker ids for the loaded model family.  model supplies
+ * GLM's BOS/EOS metadata; without it (a vocab built in tests) the GLM
+ * fallbacks are used. */
+static void vocab_set_markers(ds4_vocab *vocab, const ds4_model *model) {
     vocab->im_start_id = -1;
     vocab->im_end_id = -1;
     vocab->endoftext_id = -1;
@@ -44309,10 +44318,10 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
     }
 
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+        if (!model || !model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
         }
-        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+        if (!model || !model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
             vocab->eos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
         }
         vocab->system_id = vocab_lookup_optional(vocab, "<|system|>");
@@ -44556,10 +44565,17 @@ static const struct {
 
 #define DS4_RENDERED_MARKERS (sizeof(rendered_markers) / sizeof(rendered_markers[0]))
 
+/* A marker string is a control token only for a family that uses its role
+ * and whose vocabulary spells that token with exactly this string, as the
+ * release tokenizers do: another family's spelling (<｜User｜> in a GLM
+ * prompt, [gMASK] in a DeepSeek one) stays text. */
 static int rendered_marker_id(const ds4_vocab *vocab, size_t i) {
     if (rendered_markers[i].deepseek41_only && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
         return -1;
-    return *(const int *)((const char *)vocab + rendered_markers[i].id_offset);
+    if (*(const int *)((const char *)vocab + rendered_markers[i].id_offset) < 0) return -1;
+    int id = -1;
+    const char *text = rendered_markers[i].text;
+    return table_get(&vocab->token_to_id, text, strlen(text), &id) ? id : -1;
 }
 
 static bool rendered_marker_first_byte(uint8_t c) {

@@ -12,6 +12,9 @@
  *                                                write the GGUF's vocab as text
  *   tests/test_tokenizer --dump-ids VOCAB SHAPE FILE...
  *                                                print ids, one line per file
+ *   tests/test_tokenizer --dump-rendered-ids VOCAB SHAPE FILE...
+ *                                                the same through the
+ *                                                rendered-chat marker scan
  *
  * VOCAB is a GGUF model or a text file: the token count, one token per line,
  * then one "left right" merge per line in rank order.  --export-vocab writes it
@@ -29,7 +32,8 @@ static int failures;
 } while (0)
 
 /* ---------------------------------------------------------------------- */
-/* Reference implementation, verbatim apart from names. */
+/* Reference implementation, verbatim apart from names and the marker
+ * spelling rule noted in ref_special_token_at. */
 
 typedef struct {
     char *ptr;
@@ -189,8 +193,12 @@ static bool ref_special_token_at(const ds4_vocab *vocab, const char *p, int *tok
     for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++) {
         if (specials[i].token < 0) continue;
         size_t n = strlen(specials[i].text);
+        /* The one intended change since: a marker counts only when the
+         * vocabulary spells a token with exactly this string. */
+        int spelled = -1;
+        if (!table_get(&vocab->token_to_id, specials[i].text, n, &spelled)) continue;
         if (!strncmp(p, specials[i].text, n)) {
-            *token = specials[i].token;
+            *token = spelled;
             *len = n;
             return true;
         }
@@ -738,17 +746,21 @@ static ds4_shape parse_shape(const char *name) {
     return DS4_SHAPE_FLASH;
 }
 
-static int dump_ids(const char *vocab_path, const char *shape_name,
+/* Plain-text ids, or with `rendered` the rendered-chat path with the chat
+ * markers the engine resolves for that family. */
+static int dump_ids(const char *vocab_path, const char *shape_name, bool rendered,
                     int n_files, char **files) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = parse_shape(shape_name);
     test_vocab t = {0};
     load_vocab(&t, vocab_path);
+    if (rendered && !t.gguf) vocab_set_markers(&t.engine.vocab, NULL);
     for (int i = 0; i < n_files; i++) {
         size_t len = 0;
         char *text = read_file(files[i], &len);
         ds4_tokens tokens = {0};
-        ds4_tokenize_text(&t.engine, text, &tokens);
+        if (rendered) ds4_tokenize_rendered_chat(&t.engine, text, &tokens);
+        else ds4_tokenize_text(&t.engine, text, &tokens);
         free(text);
         for (int j = 0; j < tokens.len; j++)
             printf(j ? " %d" : "%d", tokens.v[j]);
@@ -799,7 +811,9 @@ static int export_vocab(const char *model_path, const char *out_path) {
 int main(int argc, char **argv) {
     if (argc == 4 && !strcmp(argv[1], "--export-vocab")) return export_vocab(argv[2], argv[3]);
     if (argc >= 5 && !strcmp(argv[1], "--dump-ids"))
-        return dump_ids(argv[2], argv[3], argc - 4, argv + 4);
+        return dump_ids(argv[2], argv[3], false, argc - 4, argv + 4);
+    if (argc >= 5 && !strcmp(argv[1], "--dump-rendered-ids"))
+        return dump_ids(argv[2], argv[3], true, argc - 4, argv + 4);
     const bool do_bench = argc > 1 && !strcmp(argv[1], "--bench");
     if (do_bench) {
         if (argc < 3) {
