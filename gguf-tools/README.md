@@ -355,7 +355,10 @@ projections, kept at the released BF16 by default), `--no-mtp` and
 N-grams always retain the original BF16 bytes. The converter finishes through
 the native packer above; its temporary main-weight file is removed on success.
 `gen_qwen4_unicode.py` regenerates `ds4_qwen4_unicode.inc` for the `qwen35`
-pre-tokenizer from a current `regex` release.
+pre-tokenizer from a current `regex` release. `gen_nfc_unicode.py` regenerates
+`ds4_nfc_unicode.inc`, the NFC tables for the same path, restricted to what
+the Hugging Face `tokenizers` normalizer knows; `tests/test_nfc.py` checks the
+result against that normalizer.
 
 `make test-qwen4-kernels` runs the Metal kernel tests and
 `make test-qwen4-vision` checks the vision tower against the HF implementation

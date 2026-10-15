@@ -12,6 +12,8 @@
  *                                                write the GGUF's vocab as text
  *   tests/test_tokenizer --dump-ids VOCAB SHAPE FILE...
  *                                                print ids, one line per file
+ *   tests/test_tokenizer --nfc FILE              print each line in NFC
+ *                                                (checked by tests/test_nfc.py)
  *
  * VOCAB is a GGUF model or a text file: the token count, one token per line,
  * then one "left right" merge per line in rank order.  --export-vocab writes it
@@ -754,7 +756,29 @@ static int export_vocab(const char *model_path, const char *out_path) {
     return 0;
 }
 
+static int print_nfc_lines(const char *path) {
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    for (char *line = text; line < text + len;) {
+        char *nl = memchr(line, '\n', (size_t)(text + len - line));
+        const uint64_t n = nl ? (uint64_t)(nl - line) : (uint64_t)(text + len - line);
+        char *nfc = NULL;
+        uint64_t nfc_len = 0;
+        if (qwen4_nfc(line, n, &nfc, &nfc_len)) {
+            fwrite(nfc, 1, (size_t)nfc_len, stdout);
+            free(nfc);
+        } else {
+            fwrite(line, 1, (size_t)n, stdout);
+        }
+        fputc('\n', stdout);
+        line += n + 1;
+    }
+    free(text);
+    return 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--nfc")) return print_nfc_lines(argv[2]);
     if (argc == 4 && !strcmp(argv[1], "--export-vocab")) return export_vocab(argv[2], argv[3]);
     if (argc >= 5 && !strcmp(argv[1], "--dump-ids"))
         return dump_ids(argv[2], argv[3], argc - 4, argv + 4);

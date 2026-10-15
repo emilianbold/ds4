@@ -1389,4 +1389,4 @@ clean:
 	rm -f speed-bench/session_concurrency_bench
 
 # The active tokenizer includes generated Unicode classes.
-ds4.o ds4_cpu.o ds4_cpu_test_hooks.o: ds4_qwen4_unicode.inc
+ds4.o ds4_cpu.o ds4_cpu_test_hooks.o tests/test_session_state.o tests/test_tokenizer.o: ds4_qwen4_unicode.inc ds4_nfc_unicode.inc

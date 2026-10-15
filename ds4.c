@@ -43905,6 +43905,180 @@ static qwen4_char_info qwen4_char_at(const char *s, uint64_t len, uint64_t pos) 
     return c;
 }
 
+/* Unicode NFC for the Qwen3.8 path: its released tokenizer normalizes NFC
+ * before pre-tokenization, so decomposed input (macOS file names, text from
+ * some editors) must be composed first or it splits into many more tokens.
+ * The tables match the Hugging Face tokenizers normalizer, whose Unicode
+ * data predates Python's (see gguf-tools/gen_nfc_unicode.py). */
+#include "ds4_nfc_unicode.inc"
+
+#define DS4_NFC_SBASE 0xAC00u
+#define DS4_NFC_LBASE 0x1100u
+#define DS4_NFC_VBASE 0x1161u
+#define DS4_NFC_TBASE 0x11A7u
+#define DS4_NFC_LCOUNT 19u
+#define DS4_NFC_VCOUNT 21u
+#define DS4_NFC_TCOUNT 28u
+#define DS4_NFC_NCOUNT (DS4_NFC_VCOUNT * DS4_NFC_TCOUNT)
+#define DS4_NFC_SCOUNT (DS4_NFC_LCOUNT * DS4_NFC_NCOUNT)
+
+static int nfc_ccc(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(ds4_nfc_ccc_ranges) / sizeof(ds4_nfc_ccc_ranges[0]);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < ds4_nfc_ccc_ranges[mid].lo) hi = mid;
+        else if (cp > ds4_nfc_ccc_ranges[mid].hi) lo = mid + 1;
+        else return ds4_nfc_ccc_ranges[mid].ccc;
+    }
+    return 0;
+}
+
+static bool nfc_unstable(uint32_t cp) {
+    const uint32_t block = cp >> 8;
+    if (!((ds4_nfc_unstable_blocks[block >> 6] >> (block & 63)) & 1)) return false;
+    size_t lo = 0, hi = sizeof(ds4_nfc_unstable_ranges) / sizeof(ds4_nfc_unstable_ranges[0]);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < ds4_nfc_unstable_ranges[mid].lo) hi = mid;
+        else if (cp > ds4_nfc_unstable_ranges[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+
+static const ds4_nfc_decomp *nfc_decomp(uint32_t cp) {
+    size_t lo = 0, hi = sizeof(ds4_nfc_decomps) / sizeof(ds4_nfc_decomps[0]);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < ds4_nfc_decomps[mid].cp) hi = mid;
+        else if (cp > ds4_nfc_decomps[mid].cp) lo = mid + 1;
+        else return &ds4_nfc_decomps[mid];
+    }
+    return NULL;
+}
+
+/* The primary composite of a starter and the following character, or 0. */
+static uint32_t nfc_compose(uint32_t a, uint32_t b) {
+    if (a - DS4_NFC_LBASE < DS4_NFC_LCOUNT && b - DS4_NFC_VBASE < DS4_NFC_VCOUNT)
+        return DS4_NFC_SBASE + ((a - DS4_NFC_LBASE) * DS4_NFC_VCOUNT +
+                                (b - DS4_NFC_VBASE)) * DS4_NFC_TCOUNT;
+    if (a - DS4_NFC_SBASE < DS4_NFC_SCOUNT && (a - DS4_NFC_SBASE) % DS4_NFC_TCOUNT == 0 &&
+        b - DS4_NFC_TBASE - 1 < DS4_NFC_TCOUNT - 1)
+        return a + (b - DS4_NFC_TBASE);
+    size_t lo = 0, hi = sizeof(ds4_nfc_pairs) / sizeof(ds4_nfc_pairs[0]);
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        const ds4_nfc_pair *p = &ds4_nfc_pairs[mid];
+        if (a < p->first || (a == p->first && b < p->second)) hi = mid;
+        else if (a > p->first || b > p->second) lo = mid + 1;
+        else return p->composite;
+    }
+    return 0;
+}
+
+/* Strict UTF-8: rejects overlong forms, surrogates and truncated sequences. */
+static bool utf8_decode_strict(const char *s, uint64_t len, uint64_t *pos, uint32_t *cp) {
+    const uint8_t c = (uint8_t)s[*pos];
+    int n;
+    uint32_t v, min;
+    if (c < 0x80) { *cp = c; (*pos)++; return true; }
+    if ((c & 0xe0) == 0xc0) { n = 2; v = c & 0x1f; min = 0x80; }
+    else if ((c & 0xf0) == 0xe0) { n = 3; v = c & 0x0f; min = 0x800; }
+    else if ((c & 0xf8) == 0xf0) { n = 4; v = c & 0x07; min = 0x10000; }
+    else return false;
+    if (*pos + (uint64_t)n > len) return false;
+    for (int i = 1; i < n; i++) {
+        const uint8_t cc = (uint8_t)s[*pos + (uint64_t)i];
+        if ((cc & 0xc0) != 0x80) return false;
+        v = (v << 6) | (cc & 0x3f);
+    }
+    if (v < min || v > 0x10ffff || (v >= 0xd800 && v < 0xe000)) return false;
+    *cp = v;
+    *pos += (uint64_t)n;
+    return true;
+}
+
+static void nfc_push(uint32_t **buf, size_t *n, size_t *cap, uint32_t cp) {
+    if (*n == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        *buf = xrealloc(*buf, *cap * sizeof((*buf)[0]));
+    }
+    (*buf)[(*n)++] = cp;
+}
+
+/* NFC of text into a malloc'd buffer.  Returns false, leaving *out unset,
+ * when the text is already NFC by the quick check (nothing that can
+ * decompose, reorder or combine with its predecessor) or is not valid UTF-8,
+ * which the reference tokenizer never sees and which is tokenized as is. */
+static bool qwen4_nfc(const char *text, uint64_t len, char **out, uint64_t *out_len) {
+    bool unstable = false;
+    for (uint64_t pos = 0; pos < len;) {
+        if ((uint8_t)text[pos] < 0x80) {
+            pos++;
+            continue;
+        }
+        uint32_t cp;
+        if (!utf8_decode_strict(text, len, &pos, &cp)) return false;
+        unstable |= nfc_unstable(cp);
+    }
+    if (!unstable) return false;
+
+    /* Canonical decomposition, then canonical ordering of mark runs. */
+    uint32_t *cps = NULL;
+    size_t n = 0, cap = 0;
+    for (uint64_t pos = 0; pos < len;) {
+        uint32_t cp;
+        utf8_decode_strict(text, len, &pos, &cp);
+        const uint32_t s = cp - DS4_NFC_SBASE;
+        const ds4_nfc_decomp *d;
+        if (s < DS4_NFC_SCOUNT) {
+            nfc_push(&cps, &n, &cap, DS4_NFC_LBASE + s / DS4_NFC_NCOUNT);
+            nfc_push(&cps, &n, &cap, DS4_NFC_VBASE + (s % DS4_NFC_NCOUNT) / DS4_NFC_TCOUNT);
+            if (s % DS4_NFC_TCOUNT) nfc_push(&cps, &n, &cap, DS4_NFC_TBASE + s % DS4_NFC_TCOUNT);
+        } else if ((d = nfc_decomp(cp)) != NULL) {
+            for (int i = 0; i < d->len; i++) nfc_push(&cps, &n, &cap, ds4_nfc_decomp_cps[d->off + i]);
+        } else {
+            nfc_push(&cps, &n, &cap, cp);
+        }
+    }
+    for (size_t i = 1; i < n; i++) {
+        const int c = nfc_ccc(cps[i]);
+        if (!c) continue;
+        for (size_t j = i; j > 0 && nfc_ccc(cps[j - 1]) > c; j--) {
+            const uint32_t t = cps[j];
+            cps[j] = cps[j - 1];
+            cps[j - 1] = t;
+        }
+    }
+
+    /* Canonical composition: a character combines with the last starter
+     * unless a character of the same or higher class lies between them. */
+    size_t kept = 0;
+    if (n) {
+        size_t starter = 0;
+        int last = nfc_ccc(cps[0]) ? 256 : 0;
+        kept = 1;
+        for (size_t i = 1; i < n; i++) {
+            const uint32_t cp = cps[i];
+            const int c = nfc_ccc(cp);
+            const uint32_t composite = nfc_compose(cps[starter], cp);
+            if (composite && (last < c || last == 0)) {
+                cps[starter] = composite;
+                continue;
+            }
+            if (!c) starter = kept;
+            last = c;
+            cps[kept++] = cp;
+        }
+    }
+
+    char *p = *out = xmalloc(kept * 4 + 1);
+    for (size_t i = 0; i < kept; i++) utf8_put(&p, cps[i]);
+    *out_len = (uint64_t)(p - *out);
+    free(cps);
+    return true;
+}
+
 /* Qwen3.8 pre-tokenization (tokenizer.ggml.pre = "qwen35"), the ordered
  * alternation
  *   (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ | \p{N} |
@@ -44044,7 +44218,14 @@ static void bpe_tokenize_span(const ds4_vocab *vocab, const char *text, uint64_t
         return;
     }
     if (ds4_model_is_qwen4()) {
-        bpe_tokenize_text_qwen35(vocab, text, len, out);
+        char *nfc = NULL;
+        uint64_t nfc_len = 0;
+        if (qwen4_nfc(text, len, &nfc, &nfc_len)) {
+            bpe_tokenize_text_qwen35(vocab, nfc, nfc_len, out);
+            free(nfc);
+        } else {
+            bpe_tokenize_text_qwen35(vocab, text, len, out);
+        }
         return;
     }
 
