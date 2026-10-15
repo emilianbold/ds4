@@ -193,6 +193,7 @@ typedef struct {
     agent_bash_job *bash_jobs;
     int next_bash_job_id;
     bool raw_mode_needs_restore;
+    int compact_prompt_tokens;  /* cached by agent_compact_reserve_tokens; 0 = unset */
 } agent_worker;
 
 static unsigned agent_next_prefill_label(void);
@@ -9614,38 +9615,53 @@ static bool agent_tool_observation_build(agent_worker *w,
     return true;
 }
 
-/* -1 is a rendering/embedding error, not a request to compact the context. */
+/* A transcript with one observation appended, kept from the fit check so
+ * commit does not tokenize the observation and copy its image embeddings a
+ * second time.  The message cannot be measured on its own: DeepSeek V4
+ * image layouts pad to the absolute start position, and the image path
+ * replaces the embedding buffer it is given. */
+typedef struct {
+    ds4_tokens tokens;
+    ds4_vision_span *spans;
+    size_t image_count;
+} agent_built_observation;
+
+static void agent_built_observation_free(agent_built_observation *b) {
+    ds4_tokens_free(&b->tokens);
+    agent_vision_spans_free(b->spans, b->image_count);
+    memset(b, 0, sizeof(*b));
+}
+
+/* -1 is a rendering/embedding error, not a request to compact the context.
+ * On 1 the built transcript is left in *built for agent_tool_observation_commit;
+ * otherwise *built is empty. */
 static int agent_tool_observation_fits(agent_worker *w,
                                         const agent_tool_observation *obs,
                                         int reserve_tokens,
                                         int *tokens_out,
+                                        agent_built_observation *built,
                                         char *err, size_t err_len) {
-    ds4_tokens tmp = {0};
-    ds4_vision_span *spans = NULL;
+    memset(built, 0, sizeof(*built));
     if (err_len) err[0] = '\0';
-    if (!agent_tool_observation_build(w, obs, &tmp, &spans,
+    if (!agent_tool_observation_build(w, obs, &built->tokens, &built->spans,
                                       err, err_len))
         return -1;
-    int tokens = tmp.len;
-    ds4_tokens_free(&tmp);
-    agent_vision_spans_free(spans, obs->image_count);
+    built->image_count = obs->image_count;
+    int tokens = built->tokens.len;
     if (tokens_out) *tokens_out = tokens;
     int ctx = agent_worker_effective_ctx_size(w);
-    return ctx > 0 && tokens + reserve_tokens < ctx;
+    const int fits = ctx > 0 && tokens + reserve_tokens < ctx;
+    if (!fits) agent_built_observation_free(built);
+    return fits;
 }
 
-static bool agent_tool_observation_commit(agent_worker *w,
-                                          agent_tool_observation *obs,
-                                          char *err, size_t err_len) {
-    ds4_tokens next = {0};
-    ds4_vision_span *spans = NULL;
-    if (!agent_tool_observation_build(w, obs, &next, &spans, err, err_len))
-        return false;
+static void agent_tool_observation_commit(agent_worker *w,
+                                          agent_built_observation *built) {
     ds4_tokens_free(&w->transcript);
-    w->transcript = next;
-    agent_worker_images_append(w, spans, obs->image_count);
-    free(spans);
-    return true;
+    w->transcript = built->tokens;
+    agent_worker_images_append(w, built->spans, built->image_count);
+    free(built->spans);
+    memset(built, 0, sizeof(*built));
 }
 
 /* If compaction happens while a bash process is still alive, inject a small
@@ -9772,16 +9788,20 @@ static int agent_compact_summary_budget(int ctx) {
     return budget;
 }
 
+/* Called on every turn's compaction check; the request prompt is fixed for the
+ * engine, so its length is measured once per worker. */
 static int agent_compact_reserve_tokens(agent_worker *w) {
-    char *text = agent_compact_make_prompt("context pressure before continuing the current task");
-    ds4_tokens tokens = {0};
-    ds4_chat_append_message(w->engine, &tokens, "user", text);
-    ds4_chat_append_assistant_prefix(w->engine, &tokens, DS4_THINK_NONE);
-    int reserve = tokens.len + 64 +
-                  agent_compact_summary_budget(agent_worker_effective_ctx_size(w));
-    free(text);
-    ds4_tokens_free(&tokens);
-    return reserve;
+    if (!w->compact_prompt_tokens) {
+        char *text = agent_compact_make_prompt("context pressure before continuing the current task");
+        ds4_tokens tokens = {0};
+        ds4_chat_append_message(w->engine, &tokens, "user", text);
+        ds4_chat_append_assistant_prefix(w->engine, &tokens, DS4_THINK_NONE);
+        w->compact_prompt_tokens = tokens.len;
+        free(text);
+        ds4_tokens_free(&tokens);
+    }
+    return w->compact_prompt_tokens + 64 +
+           agent_compact_summary_budget(agent_worker_effective_ctx_size(w));
 }
 
 /* A summary prefix or retained tail must never split an image block. */
@@ -10746,8 +10766,10 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         int projected_tokens = 0;
         int result_reserve = agent_tool_result_reserve_tokens(w);
         char append_err[160] = {0};
+        agent_built_observation built;
         int fits = agent_tool_observation_fits(w, &observation, result_reserve,
-                                               &projected_tokens, append_err, sizeof(append_err));
+                                               &projected_tokens, &built,
+                                               append_err, sizeof(append_err));
         if (fits < 0) goto observation_error;
         if (!fits)
         {
@@ -10765,7 +10787,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 return 1;
             }
             fits = agent_tool_observation_fits(w, &observation, result_reserve,
-                                                &projected_tokens, append_err, sizeof(append_err));
+                                                &projected_tokens, &built,
+                                                append_err, sizeof(append_err));
             if (fits < 0) goto observation_error;
             if (!fits)
             {
@@ -10779,7 +10802,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                          projected_tokens, agent_worker_effective_ctx_size(w),
                          result_reserve);
                 agent_tool_observation_puts(&observation, msg);
-                fits = agent_tool_observation_fits(w, &observation, 16, NULL,
+                fits = agent_tool_observation_fits(w, &observation, 16, NULL, &built,
                                                    append_err, sizeof(append_err));
                 if (fits < 0) goto observation_error;
                 if (!fits) {
@@ -10790,9 +10813,7 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             }
         }
-        if (!agent_tool_observation_commit(w, &observation,
-                                           append_err, sizeof(append_err)))
-            goto observation_error;
+        agent_tool_observation_commit(w, &built);
         agent_tool_observation_free(&observation);
         agent_dsml_parser_free(&dsml);
         carried_generation = 0;

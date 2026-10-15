@@ -740,8 +740,10 @@ static void test_observation_error_is_not_context_exhaustion(void) {
     agent_tool_observation_add_image(&observation, &invalid);
     char err[160] = {0};
     int count = -1;
+    agent_built_observation built = {.image_count = 99};
     AGENT_TEST_ASSERT(agent_tool_observation_fits(&worker, &observation, 16,
-                                                 &count, err, sizeof(err)) == -1);
+                                                 &count, &built, err, sizeof(err)) == -1);
+    AGENT_TEST_ASSERT(!built.tokens.v && !built.spans && built.image_count == 0);
     AGENT_TEST_ASSERT(strstr(err, "invalid image observation") != NULL);
     AGENT_TEST_ASSERT(count == -1);
     AGENT_TEST_ASSERT(worker.transcript.len == 1 && worker.transcript.v[0] == 42);
