@@ -57,10 +57,17 @@ enum {
     DS4_GPU_V41_SPLIT_REDUCE = 1u << 5,
     DS4_GPU_V41_INDEX_BF16 = 1u << 6,
     DS4_GPU_V41_DECODE_TOPK = 1u << 7,
+    /* Opt-out for the streaming expert hit validator; the V4.1 SSD decode
+     * engine-open path clears this bit so fully-cached layers need no CPU
+     * readback of the router selection (other models keep it set). */
+    DS4_GPU_V41_HIT_VALIDATOR = 1u << 8,
     DS4_GPU_V41_PLAIN_READERS = 1u << 29,   /* test only: the narrow readers' own kernels */
     DS4_GPU_V41_UNFUSED_TOPK = 1u << 30,    /* test only: the decode top-k without its fused merge */
 };
 uint32_t ds4_gpu_v41_off(void);
+/* Replace the whole opt-out mask; read once, so callers combine
+ * ds4_gpu_v41_off() first to keep existing bits. */
+void ds4_gpu_set_v41_off(uint32_t off);
 /* Weights built at load: allocated with the model views' storage options, and kept in a residency set of their
  * own; ds4_gpu_weight_residency replaces that set, n == 0 releases it. */
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_weights(uint64_t bytes);

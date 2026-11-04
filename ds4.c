@@ -74616,6 +74616,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_gpu_set_quality(e->quality);
         ds4_gpu_set_glm_model(DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA);
         ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+#ifdef __APPLE__
+        /* V4.1 SSD decode defaults the GPU-side expert-hit validator on:
+         * clearing the opt-out bit makes a fully-cached layer need no CPU
+         * readback of the router selection, so queued decode buffers are
+         * never drained for it. The getter call first parses the opt-out
+         * switches, so a user disable still wins; other models keep the
+         * bit set and their current readback policy. */
+        if (e->ssd_streaming && ds4_engine_is_deepseek41(e))
+            ds4_gpu_set_v41_off(ds4_gpu_v41_off() & ~DS4_GPU_V41_HIT_VALIDATOR);
+#endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         /* Device selection must precede the Spark-specific default. Keep
          * unmeasured layouts and checkpoints on their existing policy. */

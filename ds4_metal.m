@@ -450,6 +450,7 @@ uint32_t ds4_gpu_v41_off(void) {
             "DS4_METAL_DISABLE_V41_SPLIT_REDUCE",
             "DS4_METAL_DISABLE_V41_INDEX_BF16",
             "DS4_METAL_DISABLE_V41_DECODE_TOPK",
+            "DS4_METAL_DISABLE_STREAMING_EXPERT_HIT_VALIDATOR",
         };
         for (uint32_t i = 0; i < sizeof(names) / sizeof(*names); i++) {
             const char *v = getenv(names[i]);
@@ -459,9 +460,12 @@ uint32_t ds4_gpu_v41_off(void) {
     }
     return g_v41_off;
 }
-void ds4_gpu_test_set_v41_off(uint32_t off) {
+void ds4_gpu_set_v41_off(uint32_t off) {
     g_v41_off = off;
     g_v41_off_read = 1;
+}
+void ds4_gpu_test_set_v41_off(uint32_t off) {
+    ds4_gpu_set_v41_off(off);
 }
 static inline int ds4_gpu_v41_on(uint32_t path) { return (ds4_gpu_v41_off() & path) == 0; }
 static id<MTLComputePipelineState> g_hc_expand_pipeline;
@@ -14839,8 +14843,12 @@ static int ds4_gpu_stream_expert_masked_addr_requested(void) {
 }
 
 static int ds4_gpu_stream_expert_hit_validator_requested(void) {
+    /* Default on for V4.1 SSD decode (engine open clears the opt-out
+     * bit in the DS4_GPU_V41_* mask); the old enable switch still opts
+     * other layouts in, and the shared disable switch always wins. */
     return g_ssd_streaming_mode &&
-           getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL &&
+           (ds4_gpu_v41_on(DS4_GPU_V41_HIT_VALIDATOR) ||
+            getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL) &&
            getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HIT_VALIDATOR") == NULL;
 }
 
