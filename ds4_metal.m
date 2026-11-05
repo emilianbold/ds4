@@ -15467,7 +15467,14 @@ static int ds4_gpu_stream_expert_cache_validate_selected(
     }
 
     if (had_batch) {
-        if (ds4_gpu_end_commands() == 0) return 0;
+        /* Only this layer's router output is needed, not the whole
+         * queued batch: signal right after the validator kernel and wait
+         * for the signal, so previously flushed command buffers keep
+         * executing while the host reads the status words. A full
+         * end-of-batch drain here serializes decode (measured ~530 ms
+         * waits on the first token with one-buffer-per-layer flushing). */
+        if (ds4_gpu_signal_batch_and_wait_event("streaming expert cache validator") == 0)
+            return 0;
     } else if (!ds4_gpu_finish_command_buffer(cb, owned,
                                               "streaming expert cache validator")) {
         return 0;
@@ -15481,7 +15488,8 @@ static int ds4_gpu_stream_expert_cache_validate_selected(
         selected_ids[i] = (int32_t)words[4 + i];
     }
 
-    if (had_batch && ds4_gpu_begin_commands() == 0) return 0;
+    /* The signal path already opened the next batch buffer; the owned
+     * path finished without leaving one, exactly as before. */
     return 1;
 }
 
