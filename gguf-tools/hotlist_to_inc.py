@@ -17,8 +17,10 @@ ds4_streaming_hotlist_v41.inc.
 
 import sys
 
-MAX_LAYER = 80    # DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER
-MAX_EXPERT = 512  # DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT
+# The recorder's counting-grid bounds (ds4_metal.m); the engine's loader
+# additionally re-checks the model's own layer/expert ranges when seeding.
+MAX_LAYER = 80
+MAX_EXPERT = 512
 
 
 def fail(msg):
@@ -31,7 +33,7 @@ def parse(path):
     'layer expert hits weight' rows."""
     rows = []
     selections = 0
-    records = None
+    skipped = 0
     try:
         with open(path) as fp:
             for line in fp:
@@ -48,15 +50,20 @@ def parse(path):
                     fail("layer %d out of range 0..%d in %s" % (layer, MAX_LAYER - 1, path))
                 if not (0 <= expert < MAX_EXPERT):
                     fail("expert %d out of range 0..%d in %s" % (expert, MAX_EXPERT - 1, path))
-                if hits <= 0:
-                    fail("non-positive hits for layer %d expert %d in %s" % (layer, expert, path))
+                if hits < 0:
+                    fail("negative hits for layer %d expert %d in %s" % (layer, expert, path))
+                if hits == 0:
+                    # Skip like the engine loader does; hand-merged files
+                    # may carry zero-count rows.
+                    skipped += 1
+                    continue
                 rows.append((layer, expert, hits))
                 selections += hits
     except ValueError:
         fail("non-numeric field in %s" % path)
     except OSError as e:
         fail("cannot read %s: %s" % (path, e))
-    return rows, selections
+    return rows, selections, skipped
 
 
 def main():
@@ -66,7 +73,7 @@ def main():
     src, dst = sys.argv[1], sys.argv[2]
     name = sys.argv[3] if len(sys.argv) == 4 else "ds4_default_streaming_hotlist_v41"
 
-    rows, selections = parse(src)
+    rows, selections, skipped = parse(src)
     if not rows:
         fail("no entries in %s" % src)
     rows.sort(key=lambda r: (-r[2], r[0], r[1]))  # recorder order: hits, layer, expert
@@ -89,6 +96,8 @@ def main():
                 % (name, name, name))
     layers = len(set(r[0] for r in rows))
     print("%s: %d pairs, %d layers, %d selections" % (dst, len(rows), layers, selections))
+    if skipped:
+        print("%s: skipped %d zero-count rows" % (dst, skipped))
 
 
 if __name__ == "__main__":

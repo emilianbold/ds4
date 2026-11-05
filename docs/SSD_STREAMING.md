@@ -79,10 +79,15 @@ See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEA
 A short prompt leaves the prompt-driven expert seed nearly empty, so its first
 decode turns pay a cache miss (a disk read) for most routed experts. To cover
 that, a session can preload a hotlist: a table of (layer, expert) pairs ranked
-by how often that expert was selected in recorded runs. DeepSeek V4.1 and GLM
-ship built-in tables and seed from them at session create; the seed fills the
-expert-cache budget once, which costs roughly ten seconds of sequential reads
-on this class of machine and is a good trade for long-lived sessions.
+by how often that expert was selected in recorded runs. DeepSeek V4, GLM, and
+V4.1 all ship built-in tables; the older models seed around their prefill
+layer sweeps, and GLM demand-fills by default (it seeds only with an explicit
+count or auto cap). V4.1 seeds from its table at session create - currently
+Metal only, with the CUDA and ROCm paths keeping their own cache policies -
+and deliberately seeds the whole table, clamped to the expert-cache budget,
+rather than GLM's 4096-entry auto cap: full coverage is where the short-prompt
+win is measured. The seed fills the budget once, roughly seven seconds of
+sequential reads on an M5 Max, a good trade for long-lived sessions.
 
 The switches:
 
@@ -90,6 +95,7 @@ The switches:
 | --- | --- |
 | `DS4_METAL_STREAMING_EXPERT_HOTLIST=file` | Seed from a recorded file instead of the built-in table |
 | `--ssd-streaming-preload-experts N` | Cap how many hotlist entries are preloaded (the same count the GLM seeder honors) |
+| `DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=N` | Cap the default (unset count) seed, the same brake the GLM seeder honors |
 | `DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST=1` | Skip the seed entirely |
 | `--ssd-streaming-cold` | Keep measuring the empty cache |
 
