@@ -42513,27 +42513,6 @@ static bool ds41_seed_streaming_expert_cache_from_hotlist(
     const char *path = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
     const bool from_file = path && path[0];
     const bool profile = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST_PROFILE") != NULL;
-    /* The explicit --ssd-streaming-preload-experts count wins, the same
-     * contract the GLM seeder honors (metal_graph_streaming_expert_
-     * preload_count). Unset means the built-in table in full - unlike
-     * GLM's 4096-entry auto cap, deliberately, because full coverage is
-     * where the short-prompt win is measured - with
-     * DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP as the same brake the
-     * GLM seeder honors. A file source defaults to the cache budget
-     * below, not the built-in table's size, so an arbitrary recorded
-     * file is not truncated by an unrelated constant. */
-    uint32_t preload_count = from_file ? 0 : ds4_default_streaming_hotlist_v41_count;
-    if (preload_experts) {
-        preload_count = preload_experts;
-    } else if (!from_file) {
-        const char *cap_env = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
-        if (cap_env && cap_env[0]) {
-            char *end = NULL;
-            unsigned long cap = strtoul(cap_env, &end, 10);
-            if (end != cap_env && *end == '\0' && cap > 0 && cap < preload_count)
-                preload_count = (uint32_t)cap;
-        }
-    }
     /* Clamp to the cache budget exactly like the GLM seeder: the seed
      * is a hot preload, not a request to read past the budget and let
      * eviction discard what was read - without it, a machine with a
@@ -42558,7 +42537,29 @@ static bool ds41_seed_streaming_expert_cache_from_hotlist(
         break;
     }
     if (cache_budget == 0) return true;
-    if (preload_count == 0) preload_count = cache_budget;
+    /* The explicit --ssd-streaming-preload-experts count wins, the same
+     * contract the GLM seeder honors (metal_graph_streaming_expert_
+     * preload_count). Unset means the built-in table in full - unlike
+     * GLM's 4096-entry auto cap, deliberately, because full coverage is
+     * where the short-prompt win is measured - with
+     * DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP as the same brake the
+     * GLM seeder honors, for file sources as well. A file source
+     * defaults to the cache budget, not the built-in table's size, so
+     * an arbitrary recorded file is not truncated by an unrelated
+     * constant. */
+    uint32_t preload_count = from_file ? cache_budget
+                                       : ds4_default_streaming_hotlist_v41_count;
+    if (preload_experts) {
+        preload_count = preload_experts;
+    } else {
+        const char *cap_env = getenv("DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP");
+        if (cap_env && cap_env[0]) {
+            char *end = NULL;
+            unsigned long cap = strtoul(cap_env, &end, 10);
+            if (end != cap_env && *end == '\0' && cap > 0 && cap < preload_count)
+                preload_count = (uint32_t)cap;
+        }
+    }
     if (preload_count > cache_budget) preload_count = cache_budget;
     /* Skip when the cache already holds what the seed would install:
      * the first session create pays the reads, later ones do not. */

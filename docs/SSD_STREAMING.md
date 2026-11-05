@@ -95,7 +95,7 @@ The switches:
 | --- | --- |
 | `DS4_METAL_STREAMING_EXPERT_HOTLIST=file` | Seed from a recorded file instead of the built-in table |
 | `--ssd-streaming-preload-experts N` | Cap how many hotlist entries are preloaded (the same count the GLM seeder honors) |
-| `DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=N` | Cap the default (unset count) seed, the same brake the GLM seeder honors |
+| `DS4_METAL_STREAMING_EXPERT_AUTO_PRELOAD_CAP=N` | Cap the default (unset count) seed, for file and built-in sources alike - the same brake the GLM seeder honors |
 | `DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST=1` | Skip the seed entirely |
 | `--ssd-streaming-cold` | Keep measuring the empty cache |
 
