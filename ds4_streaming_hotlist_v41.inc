@@ -1,10 +1,9 @@
-/* Generated from DeepSeek V4.1 SSD decode routing recorded
- * with DS4_MOE_RECORD_SELECTED_HOTLIST (merged runs: a
- * 1024-token literature bench, a short-prompt bench, and
- * multi-prompt one-shot sessions; 117840 selections); every
+/* Generated from routing recorded with
+ * DS4_MOE_RECORD_SELECTED_HOTLIST (117840 selections); every
  * expert recorded selected at least once, 9448 (layer, expert)
- * pairs, in the recorder's hits-descending order so the
- * loader's rank-based priority matches observed frequency. */
+ * pairs, hits-descending so the loader's rank-based priority
+ * matches observed frequency. Regenerate: see
+ * gguf-tools/hotlist_to_inc.py and docs/SSD_STREAMING.md. */
 static const uint16_t ds4_default_streaming_hotlist_v41[][2] = {
     {36,158}, {35,61}, {37,38}, {2,154}, {23,171}, {28,334},
     {29,103}, {38,118}, {33,16}, {33,134}, {34,235}, {8,222},

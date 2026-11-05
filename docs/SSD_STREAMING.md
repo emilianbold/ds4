@@ -74,6 +74,62 @@ Leave expert preloading enabled for normal use. `--ssd-streaming-cold` and
 `--ssd-streaming-preload-experts N` are mainly useful for controlled measurements.
 See [benchmarking](PERFORMANCE.md) and the [release QA guide](../QA_BEFORE_RELEASES.md).
 
+## Seeding the cache from a routing hotlist
+
+A short prompt leaves the prompt-driven expert seed nearly empty, so its first
+decode turns pay a cache miss (a disk read) for most routed experts. To cover
+that, a session can preload a hotlist: a table of (layer, expert) pairs ranked
+by how often that expert was selected in recorded runs. DeepSeek V4.1 and GLM
+ship built-in tables and seed from them at session create; the seed fills the
+expert-cache budget once, which costs roughly ten seconds of sequential reads
+on this class of machine and is a good trade for long-lived sessions.
+
+The switches:
+
+| Switch | Effect |
+| --- | --- |
+| `DS4_METAL_STREAMING_EXPERT_HOTLIST=file` | Seed from a recorded file instead of the built-in table |
+| `DS4_METAL_V41_STREAMING_HOTLIST_PRELOAD=N` | Cap how many table entries are preloaded |
+| `DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST=1` | Skip the seed entirely |
+| `--ssd-streaming-cold` | Keep measuring the empty cache |
+
+The built-in tables are generated from real routing, and the same procedure
+reproduces them or builds one for a new model. Record selections while running
+a representative mix of workloads, accumulating across runs:
+
+```sh
+DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
+DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
+  ./ds4-bench -m MODEL --ssd-streaming \
+    --prompt-file speed-bench/promessi_sposi.txt \
+    --ctx-start 1024 --ctx-max 1024 --gen-tokens 128
+
+DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
+DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
+  ./ds4 -m MODEL --ssd-streaming --ctx 2048 \
+    --think-level 0 --temp 0 -n 48 -p "A representative prompt."
+```
+
+Each routed-layer call counts its six selections in memory; the file is
+written when the process exits. `_MERGE` makes every run load the previous
+file first, so one hotlist keeps growing (add `_FRESH=1` to start clean).
+Record with the same engine options as the intended deployment — the corpus
+determines the table.
+
+Convert the result into a compile-time table:
+
+```sh
+python3 gguf-tools/hotlist_to_inc.py hotlist.txt ds4_streaming_hotlist_v41.inc
+```
+
+The pairs keep the recorder's hits-descending order, which is what the
+loader's rank-based priority is derived from. To ship it as a built-in for a
+new model, add the generated `.inc` to the build, include it next to the
+existing tables in `ds4.c`, and add the model's variant to
+`metal_graph_streaming_expert_hotlist_load_default`. For V4.1, seeding from
+the recorded hotlist raised steady decode of a 64-token prompt from 19.8 to
+26.7 tokens/s on an M5 Max, with byte-identical greedy output.
+
 ## CUDA expert reads
 
 DeepSeek V4.1 CUDA prefill reads selected experts in file order and combines
