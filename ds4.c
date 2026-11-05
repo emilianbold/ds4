@@ -43306,12 +43306,16 @@ static bool ds41_moe_expand_batch(ds41_prefill_row *b, const ds4_model *m,
 }
 
 /* Layers per committed command buffer while decoding: the GPU starts on the
- * first buffer while the host encodes the rest. 0 keeps one buffer per token. */
+ * first buffer while the host encodes the rest. 0 keeps one buffer per token.
+ * Default 1 (flush every layer): with the hit validator removing the
+ * per-layer readback drain, a fresh buffer per layer keeps the GPU fed
+ * best on M5 Max; the sweep over DS4_METAL_V41_DECODE_FLUSH_LAYERS was
+ * monotonic in the flush count (steady 24.92 t/s at 1 down to 23.76 at 40). */
 static uint32_t ds41_decode_flush_layers(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_METAL_V41_DECODE_FLUSH_LAYERS");
-        cached = env && *env ? atoi(env) : 2;
+        cached = env && *env ? atoi(env) : 1;
         if (cached < 0) cached = 0;
     }
     return (uint32_t)cached;
