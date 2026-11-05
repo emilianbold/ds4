@@ -42500,21 +42500,21 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
  * GLM path: a short prompt leaves the prompt-driven prefill seed nearly
  * empty, so the first decode turns pay a miss storm instead. */
 static bool ds41_seed_streaming_expert_cache_from_hotlist(
-        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
+        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+        uint32_t preload_experts) {
     if (!g || !g->streaming) return true;
     if (!m || !w) return false;
     if (getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST")) return true;
 
     const char *path = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
     const bool from_file = path && path[0];
+    /* The explicit --ssd-streaming-preload-experts count wins, the same
+     * contract the GLM seeder honors (metal_graph_streaming_expert_
+     * preload_count); unset means the whole table, and the seeding
+     * primitive itself prunes to the cache budget. */
     uint32_t preload_count = ds4_default_streaming_hotlist_v41_count;
-    const char *cap_env = getenv("DS4_METAL_V41_STREAMING_HOTLIST_PRELOAD");
-    if (cap_env && cap_env[0]) {
-        char *end = NULL;
-        unsigned long cap = strtoul(cap_env, &end, 10);
-        if (end != cap_env && *end == '\0' && cap < preload_count)
-            preload_count = (uint32_t)cap;
-    }
+    if (preload_experts && preload_experts < preload_count)
+        preload_count = preload_experts;
 
     int32_t experts[DS4_MAX_LAYER][DS4_MAX_EXPERT];
     uint32_t priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT];
@@ -76444,7 +76444,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->ds41_graph.tp_world == 1 &&
             !ds41_seed_streaming_expert_cache_from_hotlist(&s->ds41_graph,
                                                            &e->model,
-                                                           &e->weights)) {
+                                                           &e->weights,
+                                                           e->ssd_streaming_preload_experts)) {
             ds41_graph_free(&s->ds41_graph);
             free(s);
             return 1;

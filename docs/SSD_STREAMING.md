@@ -89,7 +89,7 @@ The switches:
 | Switch | Effect |
 | --- | --- |
 | `DS4_METAL_STREAMING_EXPERT_HOTLIST=file` | Seed from a recorded file instead of the built-in table |
-| `DS4_METAL_V41_STREAMING_HOTLIST_PRELOAD=N` | Cap how many table entries are preloaded |
+| `--ssd-streaming-preload-experts N` | Cap how many hotlist entries are preloaded (the same count the GLM seeder honors) |
 | `DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST=1` | Skip the seed entirely |
 | `--ssd-streaming-cold` | Keep measuring the empty cache |
 
