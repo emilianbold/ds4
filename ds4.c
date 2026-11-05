@@ -1688,6 +1688,7 @@ static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
 
 #include "ds4_streaming_hotlist.inc"
 #include "ds4_streaming_hotlist_glm52.inc"
+#include "ds4_streaming_hotlist_v41.inc"
 
 static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
@@ -23026,6 +23027,9 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
     } else if (g_ds4_shape.variant == DS4_VARIANT_GLM52) {
         hotlist = ds4_default_streaming_hotlist_glm52;
         hotlist_count = ds4_default_streaming_hotlist_glm52_count;
+    } else if (g_ds4_shape.variant == DS4_VARIANT_FLASH41) {
+        hotlist = ds4_default_streaming_hotlist_v41;
+        hotlist_count = ds4_default_streaming_hotlist_v41_count;
     } else {
         *loaded_out = 0;
         return true;
@@ -42489,6 +42493,77 @@ static bool ds41_moe_finish(ds41_gpu_graph *g, uint32_t il) {
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     return ds41_moe_partial(g, m, l, il, token, g->tp_world == 2) && ds41_moe_finish(g, il);
+}
+
+/* Seed the SSD expert cache at V4.1 session create from the built-in
+ * hotlist (or DS4_METAL_STREAMING_EXPERT_HOTLIST file), mirroring the
+ * GLM path: a short prompt leaves the prompt-driven prefill seed nearly
+ * empty, so the first decode turns pay a miss storm instead. */
+static bool ds41_seed_streaming_expert_cache_from_hotlist(
+        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
+    if (!g || !g->streaming) return true;
+    if (!m || !w) return false;
+    if (getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_HOTLIST")) return true;
+
+    const char *path = getenv("DS4_METAL_STREAMING_EXPERT_HOTLIST");
+    const bool from_file = path && path[0];
+    uint32_t preload_count = ds4_default_streaming_hotlist_v41_count;
+    const char *cap_env = getenv("DS4_METAL_V41_STREAMING_HOTLIST_PRELOAD");
+    if (cap_env && cap_env[0]) {
+        char *end = NULL;
+        unsigned long cap = strtoul(cap_env, &end, 10);
+        if (end != cap_env && *end == '\0' && cap < preload_count)
+            preload_count = (uint32_t)cap;
+    }
+
+    int32_t experts[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    uint32_t priorities[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    uint32_t counts[DS4_MAX_LAYER];
+    bool seen[DS4_MAX_LAYER][DS4_MAX_EXPERT];
+    memset(experts, 0, sizeof(experts));
+    memset(priorities, 0, sizeof(priorities));
+    memset(counts, 0, sizeof(counts));
+    memset(seen, 0, sizeof(seen));
+
+    uint32_t loaded = 0;
+    if (from_file) {
+        if (!metal_graph_streaming_expert_hotlist_load_file(path,
+                                                            preload_count,
+                                                            experts,
+                                                            priorities,
+                                                            counts,
+                                                            seen,
+                                                            &loaded))
+            return false;
+    } else if (!metal_graph_streaming_expert_hotlist_load_default(preload_count,
+                                                                  experts,
+                                                                  priorities,
+                                                                  counts,
+                                                                  seen,
+                                                                  &loaded)) {
+        return false;
+    }
+    if (loaded == 0) return true;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const uint32_t n = counts[il];
+        if (n == 0) continue;
+        const ds4_layer_weights *layer = &w->layer[il];
+        const uint64_t gate_row_bytes = routed_expert_row_bytes(layer->ffn_gate_exps);
+        const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
+        const uint64_t gate_expert_bytes = layer->ffn_gate_exps->dim[1] * gate_row_bytes;
+        const uint64_t down_expert_bytes = layer->ffn_down_exps->dim[1] * down_row_bytes;
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(m, layer, il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        if (!ds4_gpu_stream_expert_cache_seed_experts(&table,
+                                                      experts[il],
+                                                      priorities[il],
+                                                      n))
+            return false;
+    }
+    return true;
 }
 
 static bool ds41_graph_encode_logits(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w) {
@@ -76360,6 +76435,19 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
                 return 1;
             }
             s->ds41_graph.allocation_bytes += UINT64_C(64) << 20;
+        }
+        /* Warm the SSD expert cache from the routing hotlist before the
+         * first prompt, like the GLM path; short prompts otherwise start
+         * with an almost-empty cache. Cold mode measures the empty
+         * cache on purpose. */
+        if (e->ssd_streaming && !e->ssd_streaming_cold &&
+            s->ds41_graph.tp_world == 1 &&
+            !ds41_seed_streaming_expert_cache_from_hotlist(&s->ds41_graph,
+                                                           &e->model,
+                                                           &e->weights)) {
+            ds41_graph_free(&s->ds41_graph);
+            free(s);
+            return 1;
         }
         if (e->tp.active) {
             s->ds41_graph.tp_world = 2;
