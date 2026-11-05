@@ -94,8 +94,11 @@ The switches:
 | `--ssd-streaming-cold` | Keep measuring the empty cache |
 
 The built-in tables are generated from real routing, and the same procedure
-reproduces them or builds one for a new model. Record selections while running
-a representative mix of workloads, accumulating across runs:
+reproduces them or builds one for a new model. Record selections while
+running a representative mix of workloads, accumulating across runs with
+`_MERGE=1`. The corpus below - two bench sizes and three one-shot prompts -
+is the one the shipped V4.1 table was recorded from, so these commands
+reproduce `ds4_streaming_hotlist_v41.inc` on the same GGUF:
 
 ```sh
 DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
@@ -106,8 +109,18 @@ DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
 
 DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
 DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
-  ./ds4 -m MODEL --ssd-streaming --ctx 2048 \
-    --think-level 0 --temp 0 -n 48 -p "A representative prompt."
+  ./ds4-bench -m MODEL --ssd-streaming \
+    --prompt-file speed-bench/promessi_sposi.txt \
+    --ctx-start 64 --ctx-max 64 --gen-tokens 96
+
+for P in "Why is the sky blue? Answer in two sentences." \
+         "Explain in exactly two sentences why sunsets look red." \
+         "Summarize the theory of evolution in two sentences."; do
+  DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
+  DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
+    ./ds4 -m MODEL --ssd-streaming --ctx 2048 \
+      --think-level 0 --temp 0 -n 48 -p "$P"
+done
 ```
 
 Each routed-layer call counts its six selections in memory; the file is

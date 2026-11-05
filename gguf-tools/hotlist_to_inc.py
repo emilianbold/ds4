@@ -31,6 +31,10 @@ determines the table. For example, merged bench and one-shot runs:
         ./ds4 -m MODEL --ssd-streaming --ctx 2048 \
             --think-level 0 --temp 0 -n 48 -p "A representative prompt."
 
+The exact corpus recorded for the shipped ds4_streaming_hotlist_v41.inc
+(two bench sizes and three one-shot prompts, which reproduce that table
+on the same GGUF) is documented in docs/SSD_STREAMING.md.
+
 Then convert:
 
     python3 gguf-tools/hotlist_to_inc.py hotlist.txt ds4_streaming_hotlist_v41.inc
