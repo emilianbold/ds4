@@ -96,9 +96,13 @@ The switches:
 The built-in tables are generated from real routing, and the same procedure
 reproduces them or builds one for a new model. Record selections while
 running a representative mix of workloads, accumulating across runs with
-`_MERGE=1`. The corpus below - two bench sizes and three one-shot prompts -
-is the one the shipped V4.1 table was recorded from, so these commands
-reproduce `ds4_streaming_hotlist_v41.inc` on the same GGUF:
+`_MERGE=1` (run from the repo root, and start with no existing
+`hotlist.txt`). The corpus below - two bench sizes and three one-shot
+prompts - is the one the shipped V4.1 table was recorded from, so these
+commands reproduce `ds4_streaming_hotlist_v41.inc` on the same GGUF:
+DeepSeek V4.1 Flash Q2, the `ds41f-q2` download
+(`DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf`). Routing depends on
+the weights, so a different GGUF produces a different table.
 
 ```sh
 DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
@@ -124,16 +128,21 @@ done
 ```
 
 Each routed-layer call counts its six selections in memory; the file is
-written when the process exits. `_MERGE` makes every run load the previous
-file first, so one hotlist keeps growing (add `_FRESH=1` to start clean).
-Record with the same engine options as the intended deployment — the corpus
-determines the table.
+written when the process exits. Short prefills are recorded too, but a
+large chunked prefill reads whole layers through the batch path and is not
+recorded — the 1024-token bench above contributes only its decode tokens.
+`_MERGE` makes every run load the previous file first, so one hotlist keeps
+growing (add `_FRESH=1` to start clean). Record with the same engine
+options as the intended deployment — the corpus determines the table.
 
 Convert the result into a compile-time table:
 
 ```sh
 python3 gguf-tools/hotlist_to_inc.py hotlist.txt ds4_streaming_hotlist_v41.inc
 ```
+
+The generated header records its selection total and pair count; a
+regeneration should match them (the shipped table's are 117840 and 9448).
 
 The pairs keep the recorder's hits-descending order, which is what the
 loader's rank-based priority is derived from. To ship it as a built-in for a
