@@ -1,50 +1,18 @@
 #!/usr/bin/env python3
 """Convert a DS4_MOE_RECORD_SELECTED_HOTLIST recording into a hotlist .inc table.
 
-The streaming expert cache can be seeded at session create from a routing
-hotlist: a table of (layer, expert) pairs ordered by observed selection
-count, which the loader converts into rank-based priorities
-(metal_graph_streaming_builtin_hotness in ds4.c). V4.1 and GLM ship
-built-in tables generated with this tool.
+Usage:
+    python3 gguf-tools/hotlist_to_inc.py RECORD_FILE OUT.inc [TABLE_NAME]
 
-Recording the routing (the env vars are read by ds4, not by this tool):
+The output pairs are kept in hits-descending order (re-sorted here, so
+hand-merged files work too), because the hotlist loader derives its
+rank-based priorities from that order. Rows with out-of-range layers or
+experts, or non-positive counts, are rejected.
 
-    DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt ./ds4-bench ... > /dev/null
-
-Every routed-layer call appends to an in-memory count table (one line per
-distinct (layer, expert) pair, six selections per call); the file is written
-when the process exits. Add DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 to
-accumulate across runs: each run first loads the previous file, so one
-hotlist can keep growing over representative workloads
-(DS4_MOE_RECORD_SELECTED_HOTLIST_FRESH=1 inverts this for a clean start).
-Record with the same engine options as the intended deployment; the corpus
-determines the table. For example, merged bench and one-shot runs:
-
-    DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
-    DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
-        ./ds4-bench -m MODEL --ssd-streaming \
-            --prompt-file speed-bench/promessi_sposi.txt \
-            --ctx-start 1024 --ctx-max 1024 --gen-tokens 128
-
-    DS4_MOE_RECORD_SELECTED_HOTLIST=hotlist.txt \
-    DS4_MOE_RECORD_SELECTED_HOTLIST_MERGE=1 \
-        ./ds4 -m MODEL --ssd-streaming --ctx 2048 \
-            --think-level 0 --temp 0 -n 48 -p "A representative prompt."
-
-The exact corpus recorded for the shipped ds4_streaming_hotlist_v41.inc
-(two bench sizes and three one-shot prompts, which reproduce that table
-on the same GGUF) is documented in docs/SSD_STREAMING.md.
-
-Then convert:
-
-    python3 gguf-tools/hotlist_to_inc.py hotlist.txt ds4_streaming_hotlist_v41.inc
-
-The output keeps the recorder's order (hits descending, then layer and
-expert ascending), which is what the loader's priority derives from; rows
-are re-sorted here so hand-merged files also work. See
-docs/SSD_STREAMING.md for how the table is wired into a model.
-
-Only Python's standard library is used.
+How to record a hotlist, and how generated tables are wired into a
+model, are documented in docs/SSD_STREAMING.md ("Seeding the cache from
+a routing hotlist"), including the exact corpus behind the shipped
+ds4_streaming_hotlist_v41.inc.
 """
 
 import sys
