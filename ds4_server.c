@@ -11223,6 +11223,28 @@ static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
+/* Where this request writes its cold checkpoint, or 0 for none.  A request
+ * served from nothing writes the chat anchor, or an aligned prefix when the
+ * was loaded: the prefill up to the anchor happens either way, and without
+ * the write the cold branch could never run again once anything matched. */
+/* Where this request writes its cold checkpoint, or 0 for none.  A request
+ * served from nothing writes the chat anchor, or an aligned prefix without
+ * one.  A request served by a shorter entry upgrades to the anchor only
+ * when the anchor clears what was loaded by a continued interval (or the
+ * configured minimum, with continued checkpoints off): a cold entry is a
+ * full-size deliberate anchor, so a token-level advance would only add a
+ * near-duplicate of the entry that already served the request. */
+static int kv_cache_cold_store_target(const kv_disk_cache *kc, int anchor,
+                                      int cached, int prompt_len) {
+    if (cached == 0) {
+        return anchor >= kc->opt.min_tokens ? anchor : kv_cache_store_len(kc, prompt_len);
+    }
+    if (anchor < kc->opt.min_tokens) return 0;
+    int min_advance = ds4_kvstore_continued_step(kc);
+    if (min_advance <= 0) min_advance = kc->opt.min_tokens;
+    return anchor - cached >= min_advance ? anchor : 0;
+}
+
 
 static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
     return ds4_kvstore_continued_store_target(kc, live_tokens);
@@ -13726,7 +13748,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (!multimodal && cached == 0 &&
+    if (!multimodal &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -13735,8 +13757,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        cold_store_len = kv_cache_cold_store_target(&s->kv, anchor, cached,
+                                                    prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -21663,6 +21685,35 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_cold_store_target_upgrades_shorter_entry(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 512;
+
+    /* Nothing reusable: the anchor, or an aligned prefix without one. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 11000, 0, 40000) == 11000);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, -1, 0, 11011) == kv_cache_store_len(&kc, 11011));
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 300, 0, 11011) == kv_cache_store_len(&kc, 11011));
+
+    /* Served by a shorter entry: upgrade only when the anchor clears the
+     * loaded entry by at least one continued interval (10240 by default),
+     * so a token-level advance never writes a near-duplicate. */
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 20480, 8192, 40000) == 20480);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 11000, 8192, 40000) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 20481, 20480, 40000) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 11000, 11000, 40000) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 11000, 20480, 40000) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, -1, 8192, 40000) == 0);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 300, 100, 40000) == 0);
+
+    /* With continued checkpoints off, the configured minimum is the floor. */
+    kc.opt.continued_interval_tokens = 0;
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 700, 100, 40000) == 700);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 612, 100, 40000) == 612);
+    TEST_ASSERT(kv_cache_cold_store_target(&kc, 611, 100, 40000) == 0);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -23170,6 +23221,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_cold_store_target_upgrades_shorter_entry();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
