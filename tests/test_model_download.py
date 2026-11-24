@@ -19,6 +19,8 @@ PART1, PART2 = Q4 + ".part1", Q4 + ".part2"
 VISION = "DeepSeek-V4.1-Flash-Vision.gguf"
 QWEN_Q2 = "Qwen3.8-Flash-Next-Q2.gguf"
 QWEN_Q4 = "Qwen3.8-Flash-Next-Q4.gguf"
+K3 = "Kimi-K3-IQ2_XXS-Q2_K.gguf"
+K3_PARTS = [f"{K3}.part-{i:02d}-of-05" for i in range(1, 6)]
 ARTIFACTS = {
     MX: (501609136128, "79608a69cd5bb919d8140c37105edc3a33419692d4e6caf4e68c901e4b359141"),
     MX_SHARDS[0]: (49353784544, "636918b09de6253bf41af29f06aac3ceeda220e46379d8a2058ef92c4e433ed8"),
@@ -37,6 +39,12 @@ ARTIFACTS = {
     PART1: (480000000000, "6442b1f9224079662c02003c0ef9ef6be6e2aff509510f681dab9e6cc41df246"),
     PART2: (38596067328, "7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0"),
     VISION: (970555552, "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"),
+    K3: (858760729248, "58d7624a421149e65b430c20f3fa388886f565ea1e5a3410adeb8ce2d62caa19"),
+    K3_PARTS[0]: (171752145849, "2a9ce3dc3754c1766eaff124d1c39610f6870873b61c2fd276e398196cc91198"),
+    K3_PARTS[1]: (171752145849, "fe087129a04e0674982d9fe19b86beee1bd9ffd00e139772ba7055251bafdd65"),
+    K3_PARTS[2]: (171752145849, "956e997f5cf2756025eaf4839759b8062700bb6dd165a5aa9c3db29da1bca5f6"),
+    K3_PARTS[3]: (171752145849, "5171d378ca3a09825dd754325fdd49fa9786b85dbd745fa11c2f61ce16e5da1a"),
+    K3_PARTS[4]: (171752145852, "e67274e7d2e2c4536f05ca15e38f873e2ea3731606b27f1a33ccb35e34c2e7e7"),
 }
 
 
@@ -89,6 +97,11 @@ def payload(name):
         return MX_PAYLOADS[name]
     if name == Q4:
         return payload(PART1) + payload(PART2)
+    if name == K3:
+        return b"".join(payload(part) for part in K3_PARTS)
+    if name == K3_PARTS[4]:
+        # As published, the last part is three bytes longer than the others.
+        return (name + "\n").encode() + b"end"
     return (name + "\n").encode()
 
 
@@ -102,11 +115,13 @@ class DownloadTests(unittest.TestCase):
         self.bin.mkdir()
         self.out = self.root / "gguf files"
         self.script = self.root / "download_model.sh"
-        text = (ROOT / "download_model.sh").read_text()
+        source = (ROOT / "download_model.sh").read_text()
+        text = source
         for name, (size, sha) in ARTIFACTS.items():
             data = payload(name)
-            self.assertIn("expected_bytes=" + str(size), text)
-            self.assertIn("expected_sha=" + sha, text)
+            # Equal-sized artifacts share one size string, so check the original.
+            self.assertIn("expected_bytes=" + str(size), source)
+            self.assertIn("expected_sha=" + sha, source)
             text = text.replace("expected_bytes=" + str(size), "expected_bytes=" + str(len(data)))
             text = text.replace("expected_sha=" + sha, "expected_sha=" + hashlib.sha256(data).hexdigest())
         self.script.write_text(text)
@@ -121,6 +136,7 @@ import sys
 args = sys.argv[1:]
 assert args[0] == 'download'
 assert args[1] == ('antirez/qwen3.8-flash-next-gguf' if args[2].startswith('Qwen')
+                   else 'antirez/kimi-k3-gguf' if args[2].startswith('Kimi')
                    else 'antirez/deepseek-v4.1-flash-gguf')
 if os.environ.get('FAIL_DOWNLOAD') or os.environ.get('FAIL_FILE') == args[2]:
     sys.exit(7)
@@ -157,7 +173,7 @@ payloads = PAYLOADS
     def test_truncated_and_corrupt_artifacts(self):
         self.out.mkdir()
         for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-mxfp4", MX), ("ds41f-vision", VISION),
-                             ("qwen38-q2", QWEN_Q2), ("qwen38-q4k", QWEN_Q4)):
+                             ("qwen38-q2", QWEN_Q2), ("qwen38-q4k", QWEN_Q4), ("k3-q2", K3)):
             with self.subTest(target=target):
                 path = self.out / name
                 path.write_bytes(b"short")
@@ -248,6 +264,7 @@ payloads = PAYLOADS
         self.assertIn("ds41f-q4", help_text)
         self.assertIn("ds41f-mxfp4", help_text)
         self.assertIn("ds41f-vision", help_text)
+        self.assertIn("k3-q2", help_text)
         self.assertIn("Unknown model", self.run_download("nonexistent", ok=False))
         self.assertFalse(self.out.exists())
 
@@ -340,6 +357,128 @@ payloads = PAYLOADS
             self.assertIn("Incorrect shard order/count", result.stderr)
             self.assertFalse((self.out / MX).exists())
             self.assertFalse((self.out / (MX + ".assembling")).exists())
+
+    def test_k3_joins_five_verified_parts(self):
+        text = self.run_download("k3-q2")
+        self.assertEqual(text.count("Verifying SHA-256"), 6)
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / K3)
+        self.assertEqual((self.out / K3).read_bytes(), payload(K3))
+        for name in K3_PARTS + [K3 + ".assembling"]:
+            self.assertFalse((self.out / name).exists())
+        self.env["FAIL_DOWNLOAD"] = "1"
+        self.assertIn("Already downloaded", self.run_download("k3-q2"))
+
+    def test_k3_resumes_without_downloading_joined_parts(self):
+        self.run_download("ds41f-q2")
+        self.env["FAIL_FILE"] = K3_PARTS[2]
+        self.run_download("k3-q2", ok=False)
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / Q2)
+        self.assertFalse((self.out / K3).exists())
+        pending = self.out / (K3 + ".assembling")
+        self.assertEqual(pending.read_bytes(), payload(K3_PARTS[0]) + payload(K3_PARTS[1]))
+        for name in K3_PARTS:
+            self.assertFalse((self.out / name).exists())
+        del self.env["FAIL_FILE"]
+        text = self.run_download("k3-q2")
+        self.assertEqual(text.count("Downloading " + K3), 3)
+        self.assertEqual((self.out / K3).read_bytes(), payload(K3))
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / K3)
+
+    def test_k3_resumes_interrupted_join(self):
+        self.env["FAIL_DOWNLOAD"] = "1"
+        self.out.mkdir()
+        pending = self.out / (K3 + ".assembling")
+        joined = payload(K3_PARTS[0]) + payload(K3_PARTS[1])
+        # Stopped before, during, and just after appending the third part.
+        for tail in (b"", payload(K3_PARTS[2])[:7], payload(K3_PARTS[2])):
+            with self.subTest(tail=len(tail)):
+                pending.write_bytes(joined + tail)
+                for name in K3_PARTS[2:]:
+                    (self.out / name).write_bytes(payload(name))
+                text = self.run_download("k3-q2")
+                # A part that is wholly in the output is not copied again.
+                self.assertEqual("Joining " + K3_PARTS[2] in text,
+                                 len(tail) < len(payload(K3_PARTS[2])))
+                self.assertEqual((self.out / K3).read_bytes(), payload(K3))
+                for name in K3_PARTS + [K3 + ".assembling"]:
+                    self.assertFalse((self.out / name).exists())
+                (self.out / K3).unlink()
+
+    def test_k3_rejects_corrupt_parts_and_assembly(self):
+        self.run_download("ds41f-q2")
+        link = self.root / "ds4flash.gguf"
+        pending = self.out / (K3 + ".assembling")
+        bad = self.out / K3_PARTS[1]
+        bad.write_bytes(b"x" * len(payload(K3_PARTS[1])))
+        self.assertIn("Checksum mismatch", self.run_download("k3-q2", ok=False))
+        self.assertEqual(link.resolve(), self.out / Q2)
+        self.assertFalse((self.out / K3).exists())
+        # The rejected part was never joined.
+        self.assertEqual(pending.read_bytes(), payload(K3_PARTS[0]))
+        bad.unlink()
+        self.env["FAIL_DOWNLOAD"] = "1"
+        for data, error in [(b"x" * len(payload(K3)), "Checksum mismatch"),
+                            (payload(K3) + b"extra", "Invalid partial assembly")]:
+            with self.subTest(error=error):
+                pending.write_bytes(data)
+                self.assertIn(error, self.run_download("k3-q2", ok=False))
+                self.assertEqual(link.resolve(), self.out / Q2)
+                self.assertFalse((self.out / K3).exists())
+                self.assertEqual(pending.read_bytes(), data)
+
+    def fake_free_space(self, free):
+        (self.bin / "sitecustomize.py").write_text(
+            "import os, shutil\nfrom collections import namedtuple\n"
+            "shutil.disk_usage = lambda _: namedtuple('usage', 'total used free')("
+            "1, 1, int(os.environ['FAKE_FREE']))\n")
+        self.env["PYTHONPATH"] = str(self.bin)
+        self.env["FAKE_FREE"] = str(free)
+
+    def test_k3_checks_peak_space_before_downloading(self):
+        self.run_download("ds41f-q2")
+        # Peak use is the whole file plus the last part, while that part is
+        # being appended; the script keeps 1 GiB spare on top.
+        peak = len(payload(K3)) + len(payload(K3_PARTS[4])) + (1 << 30)
+        self.fake_free_space(peak - 1)
+        text = self.run_download("k3-q2", ok=False)
+        self.assertIn("Not enough disk space", text)
+        self.assertNotIn("Downloading", text)
+        for name in K3_PARTS + [K3, K3 + ".assembling"]:
+            self.assertFalse((self.out / name).exists())
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / Q2)
+        self.fake_free_space(peak)
+        self.run_download("k3-q2")
+        self.assertEqual((self.out / K3).read_bytes(), payload(K3))
+
+    def test_k3_no_space_preserves_resumable_state(self):
+        self.out.mkdir()
+        pending = self.out / (K3 + ".assembling")
+        joined = payload(K3_PARTS[0]) + payload(K3_PARTS[1])
+        pending.write_bytes(joined + payload(K3_PARTS[2])[:7])
+        for name in K3_PARTS[2:]:
+            (self.out / name).write_bytes(payload(name))
+        self.env["FAIL_DOWNLOAD"] = "1"
+        # Nothing is left to download and each part is deleted once joined, so
+        # the worst moment is the end of the last, slightly longer, append. The
+        # seven bytes of the interrupted append are overwritten in place.
+        needed = len(payload(K3_PARTS[4])) - 7 + (1 << 30)
+        self.fake_free_space(needed - 1)
+        self.assertIn("Not enough disk space", self.run_download("k3-q2", ok=False))
+        self.assertEqual(pending.read_bytes(), joined + payload(K3_PARTS[2])[:7])
+        for name in K3_PARTS[2:]:
+            self.assertEqual((self.out / name).read_bytes(), payload(name))
+        self.fake_free_space(needed)
+        self.run_download("k3-q2")
+        self.assertEqual((self.out / K3).read_bytes(), payload(K3))
+
+    def test_k3_finishes_complete_assembly_on_full_disk(self):
+        self.out.mkdir()
+        (self.out / (K3 + ".assembling")).write_bytes(payload(K3))
+        self.env["FAIL_DOWNLOAD"] = "1"
+        # Only hashing and a rename remain; neither needs free space.
+        self.fake_free_space(0)
+        self.run_download("k3-q2")
+        self.assertEqual((self.out / K3).read_bytes(), payload(K3))
 
 
 if __name__ == "__main__":
