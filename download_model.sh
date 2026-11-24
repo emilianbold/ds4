@@ -40,6 +40,8 @@ GLM53_VISION_FILE="GLM-5.3-Flash-Vision-Encoder.gguf"
 QWEN38_Q4_FILE="Qwen3.8-Flash-Next-Q4.gguf"
 QWEN38_Q2_FILE="Qwen3.8-Flash-Next-Q2.gguf"
 QWEN38_VISION_FILE="mmproj-Qwen3.8-Flash-Next-Q8_0.gguf"
+K3_REPO="antirez/kimi-k3-gguf"
+K3_Q2_FILE="Kimi-K3-IQ2_XXS-Q2_K.gguf"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR=${DS4_GGUF_DIR:-"$ROOT/gguf"}
@@ -84,6 +86,7 @@ Usage:
   ./download_model.sh qwen38-q2 [--token TOKEN]
   ./download_model.sh qwen38-q4k [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
+  ./download_model.sh k3-q2 [--token TOKEN]
 
 Targets:
 
@@ -224,6 +227,13 @@ Targets:
        Qwen3.8-Flash-Next vision encoder, about 0.6 GB on disk. Load it
        with --vision; this target does not update ./ds4flash.gguf.
 
+  k3-q2
+       Kimi K3 mixed IQ2_XXS/Q2_K GGUF, 800 GiB (859 GB) on disk. Metal only;
+       it streams from SSD when it cannot stay resident (docs/KIMI_K3.md).
+       Downloads five parts in turn, joining each and deleting it before
+       the next. Needs 961 GiB (1032 GB) free to start, so a 1 TB drive is
+       too small. Downloads and joining can resume.
+
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF token
                  cache is used if present.
@@ -245,7 +255,7 @@ Qwen3.8 includes its n-grams and MTP; add --mtp to enable speculation:
 After downloading DSpark support, enable it explicitly:
   ./ds4 --dspark --mtp-model <download directory>/$DS4F_DSPARK_FILE
 
-PRO, V4.1, GLM and Qwen files use the official Hugging Face downloader
+PRO, V4.1, GLM, Qwen and Kimi files use the official Hugging Face downloader
 because they are too large, sharded, or nested for the curl path used by the
 smaller DeepSeek Flash GGUF files.
 EOF
@@ -393,6 +403,11 @@ case "$MODEL" in
         FORCE_HF_DOWNLOAD=1
         LINK_MODEL=0
         ;;
+    k3-q2)
+        REPO=$K3_REPO
+        MODEL_FILE=$K3_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
     -h|--help|help)
         usage
         exit 0
@@ -532,6 +547,30 @@ artifact_identity() {
         "$DS41_VISION_FILE")
             expected_bytes=970555552
             expected_sha=cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15
+            ;;
+        "$K3_Q2_FILE")
+            expected_bytes=858760729248
+            expected_sha=58d7624a421149e65b430c20f3fa388886f565ea1e5a3410adeb8ce2d62caa19
+            ;;
+        "$K3_Q2_FILE.part-01-of-05")
+            expected_bytes=171752145849
+            expected_sha=2a9ce3dc3754c1766eaff124d1c39610f6870873b61c2fd276e398196cc91198
+            ;;
+        "$K3_Q2_FILE.part-02-of-05")
+            expected_bytes=171752145849
+            expected_sha=fe087129a04e0674982d9fe19b86beee1bd9ffd00e139772ba7055251bafdd65
+            ;;
+        "$K3_Q2_FILE.part-03-of-05")
+            expected_bytes=171752145849
+            expected_sha=956e997f5cf2756025eaf4839759b8062700bb6dd165a5aa9c3db29da1bca5f6
+            ;;
+        "$K3_Q2_FILE.part-04-of-05")
+            expected_bytes=171752145849
+            expected_sha=5171d378ca3a09825dd754325fdd49fa9786b85dbd745fa11c2f61ce16e5da1a
+            ;;
+        "$K3_Q2_FILE.part-05-of-05")
+            expected_bytes=171752145852
+            expected_sha=e67274e7d2e2c4536f05ca15e38f873e2ea3731606b27f1a33ccb35e34c2e7e7
             ;;
         *) return 1 ;;
     esac
@@ -775,7 +814,136 @@ PY
         --output "$mx_out" --expected-bytes "$mx_bytes" --sha256 "$mx_sha" "$@"
 }
 
-if [ "$MODEL" = "ds41f-mxfp4" ]; then
+# One locked step of the K3 join; the caller downloads between steps.
+#   k3_join check  OUTPUT PART BYTES [PART BYTES]...
+#   k3_join append OUTPUT PART START END
+#   k3_join finish OUTPUT TOTAL SHA256 PART...
+k3_join() {
+    python3 - "$@" <<'PY'
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import shutil
+import sys
+
+mode, out = sys.argv[1], Path(sys.argv[2])
+pending = Path(str(out) + ".assembling")
+
+# Keep this lock file: unlinking it could allow two different locks for the
+# same download.
+with Path(str(pending) + ".lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if mode == "check":
+        # Follow the remaining steps: a missing part is downloaded, appended
+        # while it still exists, then deleted.
+        size = pending.stat().st_size if pending.exists() else 0
+        extra = peak = start = 0
+        for name, length in zip(sys.argv[3::2], map(int, sys.argv[4::2])):
+            end = start + length
+            if size < end:
+                part = Path(name)
+                extra += length - (min(part.stat().st_size, length) if part.exists() else 0)
+                peak = max(peak, extra)
+                if start or pending.exists():
+                    extra += end - max(size, start)
+                    peak = max(peak, extra)
+                    extra -= length
+            start = end
+        # Keep 1 GiB spare while anything is still to be written.
+        needed = peak + (1 << 30) if peak else 0
+        if shutil.disk_usage(out.parent).free < needed:
+            sys.exit("Not enough disk space for the K3 parts and joined GGUF: "
+                     f"need {needed / (1 << 30):.1f} GiB free. Existing files were kept.\n"
+                     "An interrupted download kept under " + str(out.parent / ".cache") +
+                     " already uses part of that and is not credited.")
+    elif mode == "append":
+        part = Path(sys.argv[3])
+        start, end = map(int, sys.argv[4:6])
+        if part.stat().st_size != end - start:
+            sys.exit("Incorrect file size: " + str(part))
+        if start == 0 and not pending.exists():
+            # The first part becomes the output without a second full copy.
+            part.rename(pending)
+            sys.exit(0)
+        # An interrupted append is redone from the start of its own part.
+        with pending.open("r+b") as dst:
+            dst.seek(start)
+            print("Joining " + part.name, flush=True)
+            with part.open("rb") as src:
+                shutil.copyfileobj(src, dst, 16 << 20)
+            dst.flush()
+            os.fsync(dst.fileno())
+        part.unlink()
+    else:
+        total, expected = int(sys.argv[3]), sys.argv[4]
+        if pending.stat().st_size != total:
+            sys.exit("Invalid partial assembly: " + str(pending) +
+                     ". Move it aside before retrying.")
+        print("Verifying SHA-256: " + str(pending), flush=True)
+        digest = hashlib.sha256()
+        with pending.open("rb") as fp:
+            for block in iter(lambda: fp.read(16 << 20), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected:
+            sys.exit("Checksum mismatch: " + str(pending) +
+                     ". Move this file aside before retrying; it was not accepted.")
+        pending.rename(out)
+        # A part survives only if the run stopped between joining and deleting it.
+        for name in sys.argv[5:]:
+            Path(name).unlink(missing_ok=True)
+PY
+}
+
+download_k3_q2() {
+    k3_out="$OUT_DIR/$K3_Q2_FILE"
+    if [ -e "$k3_out" ]; then
+        verify_download "$K3_Q2_FILE" "$k3_out"
+        echo "Already downloaded: $k3_out"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Joining the K3 download requires Python 3." >&2
+        exit 1
+    fi
+    mkdir -p "$OUT_DIR"
+    artifact_identity "$K3_Q2_FILE"
+    k3_bytes=$expected_bytes
+    k3_sha=$expected_sha
+    set --
+    for k3_index in 01 02 03 04 05; do
+        k3_part="$K3_Q2_FILE.part-$k3_index-of-05"
+        artifact_identity "$k3_part"
+        set -- "$@" "$OUT_DIR/$k3_part" "$expected_bytes"
+    done
+    # Check peak storage before downloading hundreds of GB.
+    k3_join check "$k3_out" "$@"
+    # Each part is deleted once it is joined, so the size of the partial
+    # output is the only record of which parts are already in it.
+    k3_done=0
+    if [ -e "$k3_out.assembling" ]; then
+        k3_done=$(($(wc -c < "$k3_out.assembling")))
+    fi
+    k3_end=0
+    set --
+    for k3_index in 01 02 03 04 05; do
+        k3_part="$K3_Q2_FILE.part-$k3_index-of-05"
+        set -- "$@" "$OUT_DIR/$k3_part"
+        artifact_identity "$k3_part"
+        k3_start=$k3_end
+        k3_end=$((k3_end + expected_bytes))
+        if [ "$k3_done" -ge "$k3_end" ]; then
+            continue
+        fi
+        download_one_hf "$k3_part"
+        k3_join append "$k3_out" "$OUT_DIR/$k3_part" "$k3_start" "$k3_end"
+    done
+    k3_join finish "$k3_out" "$k3_bytes" "$k3_sha" "$@"
+}
+
+if [ "$MODEL" = "k3-q2" ]; then
+    download_k3_q2
+elif [ "$MODEL" = "ds41f-mxfp4" ]; then
     download_ds41_mxfp4
 elif [ "$MODEL" = "ds41f-q4" ]; then
     download_ds41_q4
